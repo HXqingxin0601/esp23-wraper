@@ -1,9 +1,11 @@
 use std::{
     collections::BTreeSet,
+    env,
+    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
-    time::SystemTime,
     process::{Command, Stdio},
+    time::SystemTime,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,7 +16,6 @@ use serde_json::{Map, Value, json};
 const KNOWN_CHIPS: &[&str] = &[
     "esp32", "esp32c2", "esp32c3", "esp32c6", "esp32h2", "esp32s2", "esp32s3",
 ];
-
 const BUILD_TASK_LABEL: &str = "espwrap: cargo build";
 const FLASH_DEBUG_CONFIG_NAME: &str = "espwrap: Flash + Debug";
 const ATTACH_CONFIG_NAME: &str = "espwrap: Attach";
@@ -32,49 +33,59 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Generate a new project via esp-generate, then patch the generated project's .vscode files.
+    /// Generate a project via esp-generate, then patch local .vscode files.
     New {
         /// Path or command name for esp-generate.
         #[arg(long, default_value = "esp-generate")]
         esp_generate_bin: String,
-
+        /// Explicit project name to avoid interactive name inference ambiguity.
+        #[arg(long)]
+        name: Option<String>,
         /// Do not auto-add `--option vscode`.
         #[arg(long, action = ArgAction::SetTrue)]
         no_vscode_option: bool,
-
         /// Also add `--option probe-rs` before invoking esp-generate.
-        ///
-        /// This is opt-in because esp-generate marks some options, such as
-        /// `log`, as incompatible with `probe-rs`.
         #[arg(long, action = ArgAction::SetTrue)]
         add_probe_rs_option: bool,
-
         /// Skip the post-generation patching step.
         #[arg(long, action = ArgAction::SetTrue)]
         no_patch: bool,
-
-        /// Override the debug binary name if the generated project has multiple bins.
+        /// Preview .vscode changes without writing files.
+        #[arg(long, action = ArgAction::SetTrue)]
+        dry_run: bool,
+        /// Backup existing .vscode files before overwriting.
+        #[arg(long, action = ArgAction::SetTrue)]
+        backup: bool,
+        /// Override binary name for multi-bin projects.
         #[arg(long)]
         bin: Option<String>,
-
-        /// Extra arguments forwarded to esp-generate.
+        /// Extra arguments forwarded directly to esp-generate.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         esp_generate_args: Vec<String>,
     },
-
-    /// Patch an existing generated project's local .vscode files.
+    /// Patch local .vscode files for an existing project.
     Patch {
-        /// Path to the project root.
+        /// Path to the target project root.
         #[arg(default_value = ".")]
         project: PathBuf,
-
-        /// Override detected chip name.
+        /// Override auto-detected chip.
         #[arg(long)]
         chip: Option<String>,
-
-        /// Override detected debug binary name.
+        /// Override auto-detected binary name.
         #[arg(long)]
         bin: Option<String>,
+        /// Preview .vscode changes without writing files.
+        #[arg(long, action = ArgAction::SetTrue)]
+        dry_run: bool,
+        /// Backup existing .vscode files before overwriting.
+        #[arg(long, action = ArgAction::SetTrue)]
+        backup: bool,
+    },
+    /// Check toolchain/debug dependencies and common environment issues.
+    Doctor {
+        /// Treat warnings as errors (non-zero exit).
+        #[arg(long, action = ArgAction::SetTrue)]
+        strict: bool,
     },
 }
 
@@ -114,52 +125,126 @@ struct ProjectInfo {
     binary_format: String,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::New {
-            esp_generate_bin,
-            no_vscode_option,
-            add_probe_rs_option,
-            no_patch,
-            bin,
-            esp_generate_args,
-        } => cmd_new(
-            &esp_generate_bin,
-            esp_generate_args,
-            !no_vscode_option,
-            add_probe_rs_option,
-            !no_patch,
-            bin,
-        ),
-        Commands::Patch { project, chip, bin } => {
-            let project = canonicalize_lossy(&project)?;
-            patch_existing_project(&project, chip, bin)
-        }
-    }
+#[derive(Debug, Clone, Copy)]
+struct PatchOptions {
+    dry_run: bool,
+    backup: bool,
 }
 
-fn cmd_new(
-    esp_generate_bin: &str,
-    mut esp_generate_args: Vec<String>,
+#[derive(Debug)]
+struct NewCommandOptions {
+    esp_generate_bin: String,
+    name_override: Option<String>,
+    esp_generate_args: Vec<String>,
     add_vscode_option: bool,
     add_probe_rs_option: bool,
     patch_after_generate: bool,
     bin_override: Option<String>,
-) -> Result<()> {
+    patch_options: PatchOptions,
+}
+
+#[derive(Debug, Default)]
+struct PatchReport {
+    changed_files: Vec<PathBuf>,
+    unchanged_files: Vec<PathBuf>,
+    backup_files: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct FilePatchResult {
+    changed: bool,
+    backup_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct InferredTarget {
+    project_dir: PathBuf,
+    chip: Option<String>,
+}
+
+#[derive(Debug)]
+struct GenerateContext {
+    output_dir: PathBuf,
+    project_name: Option<String>,
+    chip: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DoctorTool {
+    name: &'static str,
+    command: &'static str,
+    args: &'static [&'static str],
+    required: bool,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::New {
+            esp_generate_bin,
+            name,
+            no_vscode_option,
+            add_probe_rs_option,
+            no_patch,
+            dry_run,
+            backup,
+            bin,
+            esp_generate_args,
+        } => cmd_new(NewCommandOptions {
+            esp_generate_bin,
+            name_override: name,
+            esp_generate_args,
+            add_vscode_option: !no_vscode_option,
+            add_probe_rs_option,
+            patch_after_generate: !no_patch,
+            bin_override: bin,
+            patch_options: PatchOptions { dry_run, backup },
+        }),
+        Commands::Patch {
+            project,
+            chip,
+            bin,
+            dry_run,
+            backup,
+        } => {
+            let project = canonicalize_lossy(&project)?;
+            patch_existing_project(&project, chip, bin, PatchOptions { dry_run, backup })
+        }
+        Commands::Doctor { strict } => cmd_doctor(strict),
+    }
+}
+
+fn cmd_new(options: NewCommandOptions) -> Result<()> {
+    let NewCommandOptions {
+        esp_generate_bin,
+        name_override,
+        mut esp_generate_args,
+        add_vscode_option,
+        add_probe_rs_option,
+        patch_after_generate,
+        bin_override,
+        patch_options,
+    } = options;
+
+    apply_name_override(&mut esp_generate_args, name_override.as_deref())?;
+
     if add_vscode_option && !has_option(&esp_generate_args, "vscode") {
         esp_generate_args.push("--option".to_owned());
         esp_generate_args.push("vscode".to_owned());
     }
-
     if add_probe_rs_option && !has_option(&esp_generate_args, "probe-rs") {
         esp_generate_args.push("--option".to_owned());
         esp_generate_args.push("probe-rs".to_owned());
     }
 
     let generate_context = infer_generate_context(&esp_generate_args)?;
-
     fs::create_dir_all(&generate_context.output_dir).with_context(|| {
         format!(
             "failed to create esp-generate output directory {}",
@@ -173,18 +258,16 @@ fn cmd_new(
         BTreeSet::new()
     };
 
-    let status = Command::new(esp_generate_bin)
+    let status = Command::new(&esp_generate_bin)
         .args(&esp_generate_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .with_context(|| format!("failed to launch `{esp_generate_bin}`"))?;
-
+        .with_context(|| format!("failed to launch `{}`", esp_generate_bin))?;
     if !status.success() {
         bail!("esp-generate exited with status {status}");
     }
-
     if !patch_after_generate {
         return Ok(());
     }
@@ -200,27 +283,123 @@ fn cmd_new(
             generate_context.chip,
         )?,
     };
+    patch_existing_project(
+        &inferred.project_dir,
+        inferred.chip,
+        bin_override,
+        patch_options,
+    )
+}
 
-    patch_existing_project(&inferred.project_dir, inferred.chip, bin_override)
+fn cmd_doctor(strict: bool) -> Result<()> {
+    let required_tools = [
+        DoctorTool {
+            name: "rustc",
+            command: "rustc",
+            args: &["--version"],
+            required: true,
+        },
+        DoctorTool {
+            name: "cargo",
+            command: "cargo",
+            args: &["--version"],
+            required: true,
+        },
+        DoctorTool {
+            name: "esp-generate",
+            command: "esp-generate",
+            args: &["--version"],
+            required: true,
+        },
+    ];
+    let optional_tools = [
+        DoctorTool {
+            name: "probe-rs",
+            command: "probe-rs",
+            args: &["--version"],
+            required: false,
+        },
+        DoctorTool {
+            name: "espflash",
+            command: "espflash",
+            args: &["--version"],
+            required: false,
+        },
+        DoctorTool {
+            name: "esp-config",
+            command: "esp-config",
+            args: &["--version"],
+            required: false,
+        },
+    ];
+
+    println!("espwrap doctor");
+    let mut failures = 0usize;
+    let mut warnings = 0usize;
+
+    for tool in required_tools.iter().chain(optional_tools.iter()) {
+        let (status, detail) = check_tool(*tool);
+        print_doctor_line(status, tool.name, &detail);
+        match status {
+            DoctorStatus::Fail => failures += 1,
+            DoctorStatus::Warn => warnings += 1,
+            DoctorStatus::Ok => {}
+        }
+    }
+
+    let (probe_status, probe_detail) = check_probe_scan();
+    print_doctor_line(probe_status, "probe-scan", &probe_detail);
+    match probe_status {
+        DoctorStatus::Fail => failures += 1,
+        DoctorStatus::Warn => warnings += 1,
+        DoctorStatus::Ok => {}
+    }
+
+    let (path_status, path_detail) = check_cargo_bin_on_path();
+    print_doctor_line(path_status, "path", &path_detail);
+    match path_status {
+        DoctorStatus::Fail => failures += 1,
+        DoctorStatus::Warn => warnings += 1,
+        DoctorStatus::Ok => {}
+    }
+
+    println!("summary: failures={failures}, warnings={warnings}");
+    if failures > 0 {
+        bail!("doctor found {failures} blocking issue(s)");
+    }
+    if strict && warnings > 0 {
+        bail!("doctor strict mode failed due to {warnings} warning(s)");
+    }
+    Ok(())
 }
 
 fn patch_existing_project(
     project_root: &Path,
     chip_override: Option<String>,
     bin_override: Option<String>,
+    patch_options: PatchOptions,
 ) -> Result<()> {
     let info = inspect_project(project_root, chip_override, bin_override)?;
-    patch_vscode_dir(&info)?;
+    let report = patch_vscode_dir(&info, patch_options)?;
 
-    println!(
-        "patched .vscode for `{}` at {}",
-        info.package_name,
-        info.root.display()
-    );
+    println!("project: {}", info.package_name);
+    println!("path: {}", info.root.display());
     println!("chip: {}", info.chip);
     println!("target: {}", info.target_triple);
     println!("bin: {}", info.bin_name);
-
+    println!(
+        "{} files changed, {} unchanged",
+        report.changed_files.len(),
+        report.unchanged_files.len()
+    );
+    if !report.backup_files.is_empty() {
+        println!("{} backup file(s) created", report.backup_files.len());
+    }
+    if patch_options.dry_run {
+        for path in report.changed_files {
+            println!("dry-run: would update {}", path.display());
+        }
+    }
     Ok(())
 }
 
@@ -231,7 +410,6 @@ fn inspect_project(
 ) -> Result<ProjectInfo> {
     let root = canonicalize_lossy(project_root)?;
     let manifest_path = root.join("Cargo.toml");
-
     if !manifest_path.exists() {
         bail!("{} does not contain a Cargo.toml", root.display());
     }
@@ -278,12 +456,10 @@ fn cargo_metadata(manifest_path: &Path) -> Result<CargoMetadata> {
         .arg(manifest_path)
         .output()
         .context("failed to run `cargo metadata`")?;
-
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("`cargo metadata` failed: {stderr}");
     }
-
     serde_json::from_slice(&output.stdout).context("failed to parse `cargo metadata` JSON")
 }
 
@@ -293,7 +469,6 @@ fn detect_target_triple(project_root: &Path) -> Result<String> {
         .with_context(|| format!("failed to read {}", config_path.display()))?;
     let value: toml::Value = toml::from_str(&text)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
-
     value
         .get("build")
         .and_then(|value| value.get("target"))
@@ -310,7 +485,6 @@ fn detect_chip(package: &MetadataPackage) -> Result<&'static str> {
             }
         }
     }
-
     bail!(
         "could not detect chip from Cargo.toml features for package `{}`; pass `--chip` explicitly",
         package.name
@@ -324,10 +498,8 @@ fn detect_bin_name(package: &MetadataPackage) -> Result<String> {
         .filter(|target| target.kind.iter().any(|kind| kind == "bin"))
         .map(|target| target.name.as_str())
         .collect();
-
     bins.sort_unstable();
     bins.dedup();
-
     match bins.as_slice() {
         [only] => Ok((*only).to_owned()),
         _ => {
@@ -336,11 +508,9 @@ fn detect_bin_name(package: &MetadataPackage) -> Result<String> {
                     return Ok(default_run.clone());
                 }
             }
-
             if bins.iter().any(|bin| *bin == package.name) {
                 return Ok(package.name.clone());
             }
-
             bail!(
                 "package `{}` has multiple bins ({:?}); pass `--bin <name>` explicitly",
                 package.name,
@@ -357,21 +527,61 @@ fn has_dependency(package: &MetadataPackage, dependency_name: &str) -> bool {
         .any(|dependency| dependency.name == dependency_name)
 }
 
-fn patch_vscode_dir(info: &ProjectInfo) -> Result<()> {
+fn patch_vscode_dir(info: &ProjectInfo, options: PatchOptions) -> Result<PatchReport> {
     let vscode_dir = info.root.join(".vscode");
     fs::create_dir_all(&vscode_dir)
         .with_context(|| format!("failed to create {}", vscode_dir.display()))?;
+    let mut report = PatchReport::default();
 
-    patch_settings_json(&vscode_dir.join("settings.json"), info)?;
-    patch_tasks_json(&vscode_dir.join("tasks.json"))?;
-    patch_launch_json(&vscode_dir.join("launch.json"), info)?;
-    patch_extensions_json(&vscode_dir.join("extensions.json"))?;
+    let settings_path = vscode_dir.join("settings.json");
+    record_patch_result(
+        &mut report,
+        settings_path.clone(),
+        patch_settings_json(&settings_path, info, options)?,
+    );
 
-    Ok(())
+    let tasks_path = vscode_dir.join("tasks.json");
+    record_patch_result(
+        &mut report,
+        tasks_path.clone(),
+        patch_tasks_json(&tasks_path, options)?,
+    );
+
+    let launch_path = vscode_dir.join("launch.json");
+    record_patch_result(
+        &mut report,
+        launch_path.clone(),
+        patch_launch_json(&launch_path, info, options)?,
+    );
+
+    let extensions_path = vscode_dir.join("extensions.json");
+    record_patch_result(
+        &mut report,
+        extensions_path.clone(),
+        patch_extensions_json(&extensions_path, options)?,
+    );
+
+    Ok(report)
 }
 
-fn patch_settings_json(path: &Path, info: &ProjectInfo) -> Result<()> {
+fn record_patch_result(report: &mut PatchReport, path: PathBuf, result: FilePatchResult) {
+    if result.changed {
+        report.changed_files.push(path);
+    } else {
+        report.unchanged_files.push(path);
+    }
+    if let Some(backup_path) = result.backup_path {
+        report.backup_files.push(backup_path);
+    }
+}
+
+fn patch_settings_json(
+    path: &Path,
+    info: &ProjectInfo,
+    options: PatchOptions,
+) -> Result<FilePatchResult> {
     let mut root = load_jsonc_object(path)?;
+    let before = Value::Object(root.clone());
     root.insert(
         "rust-analyzer.cargo.allTargets".to_owned(),
         Value::Bool(false),
@@ -380,39 +590,39 @@ fn patch_settings_json(path: &Path, info: &ProjectInfo) -> Result<()> {
         "rust-analyzer.cargo.target".to_owned(),
         Value::String(info.target_triple.clone()),
     );
-    write_pretty_json(path, &Value::Object(root))
+    write_json_update(path, &before, &Value::Object(root), options)
 }
 
-fn patch_tasks_json(path: &Path) -> Result<()> {
+fn patch_tasks_json(path: &Path, options: PatchOptions) -> Result<FilePatchResult> {
     let mut root = load_jsonc_object(path)?;
+    let before = Value::Object(root.clone());
     root.insert("version".to_owned(), Value::String("2.0.0".to_owned()));
-
     let tasks_value = root
         .entry("tasks".to_owned())
         .or_insert_with(|| Value::Array(Vec::new()));
     let tasks = tasks_value
         .as_array_mut()
         .ok_or_else(|| anyhow!("`tasks` in {} is not an array", path.display()))?;
-
     let build_task = json!({
         "label": BUILD_TASK_LABEL,
         "type": "shell",
         "command": "cargo",
         "args": ["build"],
-        "options": {
-            "cwd": "${workspaceFolder}"
-        },
+        "options": { "cwd": "${workspaceFolder}" },
         "problemMatcher": ["$rustc"]
     });
-
     upsert_named(tasks, "label", BUILD_TASK_LABEL, build_task);
-    write_pretty_json(path, &Value::Object(root))
+    write_json_update(path, &before, &Value::Object(root), options)
 }
 
-fn patch_launch_json(path: &Path, info: &ProjectInfo) -> Result<()> {
+fn patch_launch_json(
+    path: &Path,
+    info: &ProjectInfo,
+    options: PatchOptions,
+) -> Result<FilePatchResult> {
     let mut root = load_jsonc_object(path)?;
+    let before = Value::Object(root.clone());
     root.insert("version".to_owned(), Value::String("0.2.0".to_owned()));
-
     let configs_value = root
         .entry("configurations".to_owned())
         .or_insert_with(|| Value::Array(Vec::new()));
@@ -421,7 +631,6 @@ fn patch_launch_json(path: &Path, info: &ProjectInfo) -> Result<()> {
         .ok_or_else(|| anyhow!("`configurations` in {} is not an array", path.display()))?;
 
     let program_binary = format!("target/{}/debug/{}", info.target_triple, info.bin_name);
-
     let launch_config = json!({
         "type": "probe-rs-debug",
         "request": "launch",
@@ -432,19 +641,10 @@ fn patch_launch_json(path: &Path, info: &ProjectInfo) -> Result<()> {
         "flashingConfig": {
             "flashingEnabled": true,
             "haltAfterReset": true,
-            "formatOptions": {
-                "binaryFormat": info.binary_format
-            }
+            "formatOptions": { "binaryFormat": info.binary_format }
         },
-        "coreConfigs": [
-            {
-                "coreIndex": 0,
-                "programBinary": program_binary,
-                "rttEnabled": true
-            }
-        ]
+        "coreConfigs": [{ "coreIndex": 0, "programBinary": program_binary, "rttEnabled": true }]
     });
-
     let attach_config = json!({
         "type": "probe-rs-debug",
         "request": "attach",
@@ -452,39 +652,31 @@ fn patch_launch_json(path: &Path, info: &ProjectInfo) -> Result<()> {
         "cwd": "${workspaceFolder}",
         "preLaunchTask": BUILD_TASK_LABEL,
         "chip": info.chip,
-        "coreConfigs": [
-            {
-                "coreIndex": 0,
-                "programBinary": format!(
-                    "target/{}/debug/{}",
-                    info.target_triple, info.bin_name
-                ),
-                "rttEnabled": true
-            }
-        ]
+        "coreConfigs": [{
+            "coreIndex": 0,
+            "programBinary": format!("target/{}/debug/{}", info.target_triple, info.bin_name),
+            "rttEnabled": true
+        }]
     });
-
     upsert_launch_like(configs, "launch", launch_config);
     upsert_launch_like(configs, "attach", attach_config);
-
-    write_pretty_json(path, &Value::Object(root))
+    write_json_update(path, &before, &Value::Object(root), options)
 }
 
-fn patch_extensions_json(path: &Path) -> Result<()> {
+fn patch_extensions_json(path: &Path, options: PatchOptions) -> Result<FilePatchResult> {
     let mut root = load_jsonc_object(path)?;
+    let before = Value::Object(root.clone());
     let recommendations_value = root
         .entry("recommendations".to_owned())
         .or_insert_with(|| Value::Array(Vec::new()));
     let recommendations = recommendations_value
         .as_array_mut()
         .ok_or_else(|| anyhow!("`recommendations` in {} is not an array", path.display()))?;
-
     let mut current: BTreeSet<String> = recommendations
         .iter()
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-
     for extension in [
         "rust-lang.rust-analyzer",
         "tamasfe.even-better-toml",
@@ -492,9 +684,73 @@ fn patch_extensions_json(path: &Path) -> Result<()> {
     ] {
         current.insert(extension.to_owned());
     }
-
     *recommendations = current.into_iter().map(Value::String).collect();
-    write_pretty_json(path, &Value::Object(root))
+    write_json_update(path, &before, &Value::Object(root), options)
+}
+
+fn write_json_update(
+    path: &Path,
+    before: &Value,
+    after: &Value,
+    options: PatchOptions,
+) -> Result<FilePatchResult> {
+    if before == after {
+        return Ok(FilePatchResult {
+            changed: false,
+            backup_path: None,
+        });
+    }
+
+    if options.dry_run {
+        return Ok(FilePatchResult {
+            changed: true,
+            backup_path: None,
+        });
+    }
+
+    let backup_path = if options.backup {
+        create_backup(path)?
+    } else {
+        None
+    };
+    write_pretty_json(path, after)?;
+
+    Ok(FilePatchResult {
+        changed: true,
+        backup_path,
+    })
+}
+
+fn create_backup(path: &Path) -> Result<Option<PathBuf>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| anyhow!("failed to read file name for {}", path.display()))?;
+
+    for index in 0..=1024u16 {
+        let candidate_name = if index == 0 {
+            format!("{file_name}.bak")
+        } else {
+            format!("{file_name}.bak.{index}")
+        };
+        let candidate = path.with_file_name(candidate_name);
+        if !candidate.exists() {
+            fs::copy(path, &candidate).with_context(|| {
+                format!(
+                    "failed to create backup from {} to {}",
+                    path.display(),
+                    candidate.display()
+                )
+            })?;
+            return Ok(Some(candidate));
+        }
+    }
+
+    bail!("failed to allocate backup file name for {}", path.display())
 }
 
 fn load_jsonc_object(path: &Path) -> Result<Map<String, Value>> {
@@ -504,14 +760,12 @@ fn load_jsonc_object(path: &Path) -> Result<Map<String, Value>> {
 
     let text =
         fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-
     if text.trim().is_empty() {
         return Ok(Map::new());
     }
 
     let value: Value =
         json5::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
-
     value
         .as_object()
         .cloned()
@@ -548,7 +802,6 @@ fn upsert_launch_like(array: &mut Vec<Value>, request: &str, new_value: Value) {
         let Some(object) = item.as_object() else {
             return false;
         };
-
         let item_type = object.get("type").and_then(Value::as_str);
         let item_request = object.get("request").and_then(Value::as_str);
         let item_name = object.get("name").and_then(Value::as_str);
@@ -568,7 +821,6 @@ fn upsert_launch_like(array: &mut Vec<Value>, request: &str, new_value: Value) {
 
 fn has_option(args: &[String], wanted: &str) -> bool {
     let mut iter = args.iter();
-
     while let Some(arg) = iter.next() {
         if arg == "--option" || arg == "-o" {
             if let Some(value) = iter.next() {
@@ -589,21 +841,28 @@ fn has_option(args: &[String], wanted: &str) -> bool {
             }
         }
     }
-
     false
 }
 
-#[derive(Debug)]
-struct InferredTarget {
-    project_dir: PathBuf,
-    chip: Option<String>,
-}
+fn apply_name_override(args: &mut Vec<String>, name_override: Option<&str>) -> Result<()> {
+    let Some(name) = name_override else {
+        return Ok(());
+    };
 
-#[derive(Debug)]
-struct GenerateContext {
-    output_dir: PathBuf,
-    project_name: Option<String>,
-    chip: Option<String>,
+    let inferred = infer_generate_context(args)?;
+    if let Some(existing) = inferred.project_name {
+        if existing == name {
+            return Ok(());
+        }
+        bail!(
+            "conflicting project names: `--name {}` and positional `{}`; keep only one",
+            name,
+            existing
+        );
+    }
+
+    args.push(name.to_owned());
+    Ok(())
 }
 
 fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
@@ -613,6 +872,13 @@ fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
     let mut iter = args.iter().peekable();
 
     while let Some(arg) = iter.next() {
+        if arg == "--" {
+            for remaining in iter {
+                positionals.push(remaining.to_owned());
+            }
+            break;
+        }
+
         match arg.as_str() {
             "-O" | "--output-path" => {
                 let value = iter
@@ -646,14 +912,13 @@ fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
         }
     }
 
-    let output_path = match output_path {
+    let output_dir = match output_path {
         Some(path) if path.is_absolute() => path,
         Some(path) => std::env::current_dir()?.join(path),
         None => std::env::current_dir()?,
     };
-
     Ok(GenerateContext {
-        output_dir: output_path,
+        output_dir,
         project_name: positionals.last().cloned(),
         chip,
     })
@@ -661,7 +926,6 @@ fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
 
 fn snapshot_immediate_dirs(root: &Path) -> Result<BTreeSet<String>> {
     let mut entries = BTreeSet::new();
-
     for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
         let entry = entry.with_context(|| format!("failed to read entry in {}", root.display()))?;
         if entry
@@ -672,7 +936,6 @@ fn snapshot_immediate_dirs(root: &Path) -> Result<BTreeSet<String>> {
             entries.insert(entry.file_name().to_string_lossy().to_string());
         }
     }
-
     Ok(entries)
 }
 
@@ -682,9 +945,8 @@ fn infer_generated_project_from_snapshot(
     chip: Option<String>,
 ) -> Result<InferredTarget> {
     let mut candidates = Vec::new();
-
-    for entry in
-        fs::read_dir(output_dir).with_context(|| format!("failed to read {}", output_dir.display()))?
+    for entry in fs::read_dir(output_dir)
+        .with_context(|| format!("failed to read {}", output_dir.display()))?
     {
         let entry =
             entry.with_context(|| format!("failed to read entry in {}", output_dir.display()))?;
@@ -695,7 +957,6 @@ fn infer_generated_project_from_snapshot(
         if !file_type.is_dir() {
             continue;
         }
-
         let name = entry.file_name().to_string_lossy().to_string();
         if preexisting_entries.contains(&name) {
             continue;
@@ -705,24 +966,21 @@ fn infer_generated_project_from_snapshot(
         if !project_dir.join("Cargo.toml").exists() {
             continue;
         }
-
         let modified_at = entry
             .metadata()
             .and_then(|metadata| metadata.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH);
-
         candidates.push((project_dir, modified_at));
     }
 
     candidates.sort_by_key(|(_, modified_at)| *modified_at);
-
     match candidates.as_slice() {
         [(project_dir, _)] => Ok(InferredTarget {
             project_dir: project_dir.clone(),
             chip,
         }),
         [] => bail!(
-            "unable to infer generated project path from interactive esp-generate run in {}; pass NAME on the command line or run `espwrap patch <path>`",
+            "unable to infer generated project path from interactive esp-generate run in {}; pass --name or run `espwrap patch <path>`",
             output_dir.display()
         ),
         _ => {
@@ -737,6 +995,145 @@ fn infer_generated_project_from_snapshot(
             )
         }
     }
+}
+
+fn check_tool(tool: DoctorTool) -> (DoctorStatus, String) {
+    let output = Command::new(tool.command).args(tool.args).output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let detail = summarize_command_output(&output).unwrap_or_else(|| "ok".to_owned());
+            (DoctorStatus::Ok, detail)
+        }
+        Ok(output) => {
+            let detail = format!(
+                "command failed (exit {:?}): {}",
+                output.status.code(),
+                summarize_command_output(&output).unwrap_or_else(|| "no output".to_owned())
+            );
+            if tool.required {
+                (DoctorStatus::Fail, detail)
+            } else {
+                (DoctorStatus::Warn, detail)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let detail = format!("{} is not installed or not on PATH", tool.command);
+            if tool.required {
+                (DoctorStatus::Fail, detail)
+            } else {
+                (DoctorStatus::Warn, detail)
+            }
+        }
+        Err(error) => {
+            let detail = format!("failed to run {}: {error}", tool.command);
+            if tool.required {
+                (DoctorStatus::Fail, detail)
+            } else {
+                (DoctorStatus::Warn, detail)
+            }
+        }
+    }
+}
+
+fn check_probe_scan() -> (DoctorStatus, String) {
+    let output = Command::new("probe-rs").arg("list").output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let probes: Vec<&str> = stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .collect();
+            if probes.is_empty() {
+                (
+                    DoctorStatus::Warn,
+                    "probe-rs is installed but no probe was detected".to_owned(),
+                )
+            } else {
+                (
+                    DoctorStatus::Ok,
+                    format!("{} probe(s) detected", probes.len()),
+                )
+            }
+        }
+        Ok(output) => (
+            DoctorStatus::Warn,
+            format!(
+                "`probe-rs list` failed: {}",
+                summarize_command_output(&output).unwrap_or_else(|| "no output".to_owned())
+            ),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+            DoctorStatus::Warn,
+            "probe-rs is not installed; probe scan skipped".to_owned(),
+        ),
+        Err(error) => (
+            DoctorStatus::Warn,
+            format!("failed to run `probe-rs list`: {error}"),
+        ),
+    }
+}
+
+fn check_cargo_bin_on_path() -> (DoctorStatus, String) {
+    let Some(cargo_bin) = detect_cargo_bin_dir() else {
+        return (
+            DoctorStatus::Warn,
+            "could not determine Cargo bin directory".to_owned(),
+        );
+    };
+
+    if path_has_entry(&cargo_bin) {
+        (
+            DoctorStatus::Ok,
+            format!("Cargo bin is on PATH: {}", cargo_bin.display()),
+        )
+    } else {
+        (
+            DoctorStatus::Warn,
+            format!("Cargo bin is not on PATH: {}", cargo_bin.display()),
+        )
+    }
+}
+
+fn detect_cargo_bin_dir() -> Option<PathBuf> {
+    if let Some(cargo_home) = env::var_os("CARGO_HOME") {
+        return Some(PathBuf::from(cargo_home).join("bin"));
+    }
+    let home = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".cargo").join("bin"))
+}
+
+fn path_has_entry(target: &Path) -> bool {
+    let Some(path_value) = env::var_os("PATH") else {
+        return false;
+    };
+    for entry in env::split_paths(&path_value) {
+        if paths_equal(&entry, target) {
+            return true;
+        }
+    }
+    false
+}
+
+fn summarize_command_output(output: &std::process::Output) -> Option<String> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(line) = stdout.lines().find(|line| !line.trim().is_empty()) {
+        return Some(line.trim().to_owned());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    stderr
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_owned())
+}
+
+fn print_doctor_line(status: DoctorStatus, name: &str, detail: &str) {
+    let label = match status {
+        DoctorStatus::Ok => "[ok]",
+        DoctorStatus::Warn => "[warn]",
+        DoctorStatus::Fail => "[fail]",
+    };
+    println!("{label:<7} {name:<12} {detail}");
 }
 
 fn canonicalize_lossy(path: &Path) -> Result<PathBuf> {
@@ -762,8 +1159,10 @@ fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        has_option, infer_generate_context, infer_generated_project_from_snapshot,
+        PatchOptions, apply_name_override, create_backup, has_option, infer_generate_context,
+        infer_generated_project_from_snapshot, write_json_update,
     };
+    use serde_json::{Map, Value};
     use std::{
         collections::BTreeSet,
         fs,
@@ -781,7 +1180,6 @@ mod tests {
             "--option=probe-rs".to_owned(),
             "demo".to_owned(),
         ];
-
         assert!(has_option(&args, "vscode"));
         assert!(has_option(&args, "probe-rs"));
         assert!(!has_option(&args, "wifi"));
@@ -797,7 +1195,6 @@ mod tests {
             "generated".to_owned(),
             "demo".to_owned(),
         ];
-
         let context = infer_generate_context(&args).expect("context inference should succeed");
         assert_eq!(context.chip.as_deref(), Some("esp32c3"));
         assert_eq!(context.project_name.as_deref(), Some("demo"));
@@ -819,11 +1216,32 @@ mod tests {
             "-o".to_owned(),
             "vscode".to_owned(),
         ];
-
         let context = infer_generate_context(&args).expect("context inference should succeed");
         assert_eq!(context.chip.as_deref(), Some("esp32c3"));
         assert_eq!(context.project_name, None);
-        assert_eq!(context.output_dir, std::env::current_dir().unwrap().join("generated"));
+        assert_eq!(
+            context.output_dir,
+            std::env::current_dir().unwrap().join("generated")
+        );
+    }
+
+    #[test]
+    fn applies_name_override_when_missing() {
+        let mut args = vec![
+            "--chip".to_owned(),
+            "esp32c3".to_owned(),
+            "--headless".to_owned(),
+        ];
+        apply_name_override(&mut args, Some("myproj")).expect("override should succeed");
+        assert_eq!(args.last().map(String::as_str), Some("myproj"));
+    }
+
+    #[test]
+    fn rejects_conflicting_name_override() {
+        let mut args = vec!["--chip".to_owned(), "esp32c3".to_owned(), "demo".to_owned()];
+        let error = apply_name_override(&mut args, Some("other"))
+            .expect_err("override should fail on conflict");
+        assert!(error.to_string().contains("conflicting project names"));
     }
 
     #[test]
@@ -838,21 +1256,84 @@ mod tests {
 
         fs::create_dir_all(&existing).expect("should create existing dir");
         fs::create_dir_all(&created).expect("should create generated dir");
-        fs::write(created.join("Cargo.toml"), "[package]\nname='fresh-proj'\nversion='0.1.0'\n")
-            .expect("should create Cargo.toml");
+        fs::write(
+            created.join("Cargo.toml"),
+            "[package]\nname='fresh-proj'\nversion='0.1.0'\n",
+        )
+        .expect("should create Cargo.toml");
 
         let mut snapshot = BTreeSet::new();
         snapshot.insert("existing".to_owned());
 
-        let inferred = infer_generated_project_from_snapshot(
-            &root,
-            &snapshot,
-            Some("esp32c3".to_owned()),
-        )
-        .expect("should infer created project");
-
+        let inferred =
+            infer_generated_project_from_snapshot(&root, &snapshot, Some("esp32c3".to_owned()))
+                .expect("should infer created project");
         assert_eq!(inferred.project_dir, created);
         assert_eq!(inferred.chip.as_deref(), Some("esp32c3"));
+
+        fs::remove_dir_all(&root).expect("should clean temp directory");
+    }
+
+    #[test]
+    fn create_backup_uses_numeric_suffix_when_needed() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("espwrap-backup-{unique}"));
+        fs::create_dir_all(&root).expect("should create temp directory");
+
+        let target = root.join("launch.json");
+        fs::write(&target, "{ \"a\": 1 }").expect("should create launch.json");
+        fs::write(root.join("launch.json.bak"), "old").expect("should create existing backup");
+
+        let backup = create_backup(&target)
+            .expect("backup should succeed")
+            .expect("backup path should exist");
+        assert_eq!(
+            backup.file_name().and_then(|name| name.to_str()),
+            Some("launch.json.bak.1")
+        );
+
+        fs::remove_dir_all(&root).expect("should clean temp directory");
+    }
+
+    #[test]
+    fn write_json_update_respects_dry_run() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("espwrap-dryrun-{unique}"));
+        fs::create_dir_all(&root).expect("should create temp directory");
+
+        let target = root.join("settings.json");
+        fs::write(&target, "{ \"a\": 1 }\n").expect("should create settings file");
+
+        let mut before = Map::new();
+        before.insert("a".to_owned(), Value::Number(1.into()));
+        let before = Value::Object(before);
+
+        let mut after = Map::new();
+        after.insert("a".to_owned(), Value::Number(1.into()));
+        after.insert("b".to_owned(), Value::Bool(true));
+        let after = Value::Object(after);
+
+        let result = write_json_update(
+            &target,
+            &before,
+            &after,
+            PatchOptions {
+                dry_run: true,
+                backup: true,
+            },
+        )
+        .expect("dry-run write should succeed");
+
+        assert!(result.changed);
+        assert!(!root.join("settings.json.bak").exists());
+        let text = fs::read_to_string(&target).expect("should still read original file");
+        assert!(!text.contains("\"b\""));
 
         fs::remove_dir_all(&root).expect("should clean temp directory");
     }

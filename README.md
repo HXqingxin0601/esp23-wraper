@@ -1,116 +1,139 @@
 # espwrap
 
-`espwrap` is a small host-side CLI that wraps `esp-generate` and patches the
-generated project's local `.vscode/*.json` files for `probe-rs`.
+`espwrap` is a host-side CLI that wraps `esp-generate` and patches project-local
+VS Code debug configuration for `probe-rs`.
 
-It does **not** edit VS Code user defaults. It only edits the generated
-project's own:
+It only edits files in the target project, never VS Code user/global settings.
 
-- `.vscode/launch.json`
-- `.vscode/tasks.json`
-- `.vscode/settings.json`
-- `.vscode/extensions.json`
+## What it solves
 
-## Why this exists
+- Generate an ESP Rust project with `esp-generate`.
+- Auto-patch local `.vscode/*.json` with project-specific values:
+  - chip
+  - target triple
+  - binary path
+  - `probe-rs` launch/attach entries
+- Keep existing JSON files and merge updates instead of replacing blindly.
+- Provide diagnostics via `espwrap doctor`.
 
-`esp-generate` can already create VS Code files, but those files are generic.
-`espwrap` fills in project-specific values such as:
+## Commands
 
-- `chip`
-- `programBinary`
-- Rust target triple
-- `probe-rs` launch / attach config
-
-It also merges into existing VS Code files instead of blindly overwriting them.
-
-## Install globally
-
-If you want to use it as a global command:
-
-```powershell
-cd tools\espwrap
-.\install.ps1
+```text
+espwrap new     # generate + patch
+espwrap patch   # patch an existing project
+espwrap doctor  # verify local toolchain and debug dependencies
 ```
 
-That script:
+## Installation
 
-- detects your Rust host target triple automatically
-- installs `espwrap` with `cargo install`
-- forces a host-side install instead of inheriting the parent embedded target
-- uses `--locked` for reproducibility
-- uses `--force` by default so updating is easy during development
+### Prerequisites
 
-If PowerShell script execution is restricted, use:
+- Rust toolchain (`cargo`, `rustc`)
+- `esp-generate`
+
+Install `esp-generate` if needed:
+
+```powershell
+cargo install esp-generate --locked
+```
+
+### Global install (Windows)
 
 ```powershell
 cd tools\espwrap
 .\install.cmd
 ```
 
-To uninstall:
+Or:
 
 ```powershell
 cd tools\espwrap
-.\uninstall.ps1
+powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-After installation, verify with:
+### Global install (macOS/Linux)
+
+```bash
+cd tools/espwrap
+./install.sh
+```
+
+### Verify
 
 ```powershell
+espwrap --version
 espwrap --help
-Get-Command espwrap
-where.exe espwrap
-```
-
-If `where.exe espwrap` finds nothing, check whether this directory is on your PATH:
-
-```text
-C:\Users\<you>\.cargo\bin
 ```
 
 ## Usage
 
-Run it from this directory so it builds as a host-side Windows CLI instead of
-inheriting the parent embedded target:
+### 1) Create project (recommended: explicit name)
+
+```powershell
+espwrap new --headless --chip esp32c3 --name myproj
+```
+
+### 2) Create project and enable additional template options
+
+```powershell
+espwrap new --headless --chip esp32c3 --name myproj -- -o unstable-hal -o embassy
+```
+
+Notes:
+
+- `espwrap` forwards extra args after `--` directly to `esp-generate`.
+- `--option vscode` is auto-added unless `--no-vscode-option` is used.
+- `--option probe-rs` is opt-in via `--add-probe-rs-option`.
+
+### 3) Patch existing project
+
+```powershell
+espwrap patch d:\path\to\project
+```
+
+Useful flags:
+
+- `--dry-run`: preview changes without writing files.
+- `--backup`: create `*.bak` backups before overwriting.
+- `--chip <chip>`: force chip if auto-detect is ambiguous.
+- `--bin <name>`: force binary name in multi-bin projects.
+
+### 4) Diagnose environment
+
+```powershell
+espwrap doctor
+espwrap doctor --strict
+```
+
+`doctor` checks required and optional tools, probe visibility, and Cargo bin PATH.
+
+## Files espwrap patches
+
+- `.vscode/settings.json`
+- `.vscode/tasks.json`
+- `.vscode/launch.json`
+- `.vscode/extensions.json`
+
+Only these project-local files are touched.
+
+## Development
 
 ```powershell
 cd tools\espwrap
-cargo run -- new --headless --chip esp32c3 your-project
+cargo fmt
+cargo build
+cargo test --no-run
 ```
 
-If you want `esp-generate` itself to also enable the `probe-rs` template
-option, add:
+If your environment blocks running freshly built binaries, `cargo test --no-run`
+still validates compilation of all test targets.
 
-```powershell
-cargo run -- new --add-probe-rs-option --headless --chip esp32c3 your-project
-```
+## Roadmap
 
-That flag is opt-in because `esp-generate` marks some options, such as `log`,
-as incompatible with `probe-rs`.
+- Add richer `doctor` checks for USB/JTAG drivers per platform.
+- Add optional JSON output mode for CI integrations.
+- Add end-to-end integration tests for generated template projects.
 
-To patch an existing project:
+## License
 
-```powershell
-cargo run -- patch d:\path\to\your-project
-```
-
-If a project has multiple binaries, specify which one should be used for
-debugging:
-
-```powershell
-cargo run -- patch d:\path\to\your-project --bin my_app
-```
-
-## What is auto-detected
-
-- chip, from Cargo dependency features when possible
-- target triple, from `.cargo/config.toml`
-- binary name, when the project has a single bin or an obvious default
-
-## What still is not magic
-
-- Multi-bin projects may need `--bin`
-- Mixed-chip repos may need `--chip`
-- Hardware availability still matters: `probe-rs list` must see a probe before
-  VS Code debug will work
-- It edits project-local `.vscode/*.json`, not VS Code user defaults
+MIT. See [LICENSE](LICENSE).

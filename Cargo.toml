@@ -1,7 +1,13 @@
 [package]
 name = "espwrap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "Wrap esp-generate and patch project-local VS Code probe-rs config."
+license = "MIT"
+readme = "README.md"
+keywords = ["esp32", "probe-rs", "vscode", "embedded", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1.0"
