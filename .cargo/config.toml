@@ -1,0 +1,4 @@
+[build]
+# This is a host-side helper CLI, not firmware. Force the host target so it
+# doesn't inherit the parent embedded target triple from `led_on/.cargo/config.toml`.
+target = "x86_64-pc-windows-msvc"
