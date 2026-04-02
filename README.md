@@ -38,6 +38,7 @@ espwrap doctor  # verify local toolchain and debug dependencies
 
 - Rust toolchain (`cargo`, `rustc`)
 - `esp-generate`
+- For VS Code debugging: `probe-rs` tools and VS Code `probe-rs` extension
 
 Install `esp-generate` if needed:
 
@@ -45,24 +46,40 @@ Install `esp-generate` if needed:
 cargo install esp-generate --locked
 ```
 
+Install `probe-rs` tools if needed (required for flash/debug workflows):
+
+```powershell
+cargo install probe-rs-tools --locked
+```
+
+You can also use other install methods from the official docs:
+https://probe.rs/docs/getting-started/installation/
+
+Install the VS Code extension (required for VS Code debug sessions):
+
+```powershell
+code --install-extension probe-rs.probe-rs-debugger
+```
+
+If the `code` CLI is not available, install `probe-rs-debugger` from the VS Code Extensions UI.
+
+`espwrap` writes project-local extension recommendations, but does not auto-install VS Code extensions.
+
 ### Global install (Windows)
 
 ```powershell
-cd tools\espwrap
 .\install.cmd
 ```
 
 Or:
 
 ```powershell
-cd tools\espwrap
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
 ### Global install (macOS/Linux)
 
 ```bash
-cd tools/espwrap
 ./install.sh
 ```
 
