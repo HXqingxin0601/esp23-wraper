@@ -27,6 +27,12 @@ cargo test
 
 Use concise, imperative commit messages (for example: `add doctor strict mode`).
 
+## Contribution license
+
+By submitting code, docs, or other content to this repository, you confirm you
+have the right to do so and agree your contribution is licensed under the same
+MIT license as this project.
+
 ## Reporting issues
 
 When opening an issue, include:
