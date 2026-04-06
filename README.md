@@ -16,6 +16,7 @@ It only edits files in the target project, never VS Code user/global settings.
 ## What it solves
 
 - Generate an ESP Rust project with `esp-generate`.
+- Check blocking dependencies before `new`/`patch` start, so failures happen early.
 - Auto-patch local `.vscode/*.json` with project-specific values:
   - chip
   - target triple
@@ -23,6 +24,7 @@ It only edits files in the target project, never VS Code user/global settings.
   - `probe-rs` launch/attach entries
 - Keep existing JSON files and merge updates instead of replacing blindly.
 - Provide diagnostics via `espwrap doctor`.
+- Offer guided installation for supported missing Cargo-installed tools.
 
 ## Commands
 
@@ -98,6 +100,9 @@ espwrap --help
 espwrap new --headless --chip esp32c3 --name myproj
 ```
 
+If `esp-generate` is missing, `espwrap new` now fails early with a clear install hint.
+In an interactive terminal it can also prompt to install supported missing tools for you.
+
 ### 2) Create project and enable additional template options
 
 ```powershell
@@ -109,6 +114,8 @@ Notes:
 - `espwrap` forwards extra args after `--` directly to `esp-generate`.
 - `--option vscode` is auto-added unless `--no-vscode-option` is used.
 - `--option probe-rs` is opt-in via `--add-probe-rs-option`.
+- `--install-missing` auto-installs supported missing tools such as `esp-generate`.
+- `espwrap new --help` prints both `espwrap`'s own flags and the current `esp-generate --help` output.
 
 ### 3) Patch existing project
 
@@ -127,10 +134,15 @@ Useful flags:
 
 ```powershell
 espwrap doctor
+espwrap doctor --fix
+espwrap doctor --json
 espwrap doctor --strict
 ```
 
 `doctor` checks required and optional tools, probe visibility, and Cargo bin PATH.
+Use `--fix` to install supported missing Cargo-based tools such as `esp-generate`,
+`probe-rs-tools`, `espflash`, and `esp-config`.
+Use `--json` when you want machine-readable output for scripts, CI, or editor integrations.
 
 ## Files espwrap patches
 

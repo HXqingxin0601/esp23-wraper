@@ -3,13 +3,14 @@ use std::{
     env,
     ffi::OsStr,
     fs,
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::SystemTime,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -19,6 +20,7 @@ const KNOWN_CHIPS: &[&str] = &[
 const BUILD_TASK_LABEL: &str = "espwrap: cargo build";
 const FLASH_DEBUG_CONFIG_NAME: &str = "espwrap: Flash + Debug";
 const ATTACH_CONFIG_NAME: &str = "espwrap: Attach";
+const RUSTUP_INSTALL_URL: &str = "https://rustup.rs/";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,6 +40,9 @@ enum Commands {
         /// Path or command name for esp-generate.
         #[arg(long, default_value = "esp-generate")]
         esp_generate_bin: String,
+        /// Auto-install supported missing tools via `cargo install`.
+        #[arg(long, action = ArgAction::SetTrue)]
+        install_missing: bool,
         /// Explicit project name to avoid interactive name inference ambiguity.
         #[arg(long)]
         name: Option<String>,
@@ -86,6 +91,12 @@ enum Commands {
         /// Treat warnings as errors (non-zero exit).
         #[arg(long, action = ArgAction::SetTrue)]
         strict: bool,
+        /// Attempt to install supported missing tools via `cargo install`.
+        #[arg(long, action = ArgAction::SetTrue, conflicts_with = "json_output")]
+        fix: bool,
+        /// Emit machine-readable JSON instead of human-readable text.
+        #[arg(long = "json", action = ArgAction::SetTrue)]
+        json_output: bool,
     },
 }
 
@@ -134,6 +145,7 @@ struct PatchOptions {
 #[derive(Debug)]
 struct NewCommandOptions {
     esp_generate_bin: String,
+    install_missing: bool,
     name_override: Option<String>,
     esp_generate_args: Vec<String>,
     add_vscode_option: bool,
@@ -157,6 +169,14 @@ struct FilePatchResult {
 }
 
 #[derive(Debug)]
+struct DoctorCheckReport {
+    name: String,
+    status: DoctorStatus,
+    detail: String,
+    required: bool,
+}
+
+#[derive(Debug)]
 struct InferredTarget {
     project_dir: PathBuf,
     chip: Option<String>,
@@ -176,19 +196,109 @@ enum DoctorStatus {
     Fail,
 }
 
+impl DoctorStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            DoctorStatus::Ok => "ok",
+            DoctorStatus::Warn => "warn",
+            DoctorStatus::Fail => "fail",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct DoctorTool {
     name: &'static str,
     command: &'static str,
     args: &'static [&'static str],
-    required: bool,
+    install_package: Option<&'static str>,
+    install_hint: &'static str,
+}
+
+#[derive(Debug)]
+enum ToolProbe {
+    Available(String),
+    Missing,
+    Error(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InstallDisposition {
+    Never,
+    Prompt,
+    Auto,
+}
+
+fn rustc_tool() -> DoctorTool {
+    DoctorTool {
+        name: "rustc",
+        command: "rustc",
+        args: &["--version"],
+        install_package: None,
+        install_hint: RUSTUP_INSTALL_URL,
+    }
+}
+
+fn cargo_tool() -> DoctorTool {
+    DoctorTool {
+        name: "cargo",
+        command: "cargo",
+        args: &["--version"],
+        install_package: None,
+        install_hint: RUSTUP_INSTALL_URL,
+    }
+}
+
+fn esp_generate_tool() -> DoctorTool {
+    DoctorTool {
+        name: "esp-generate",
+        command: "esp-generate",
+        args: &["--version"],
+        install_package: Some("esp-generate"),
+        install_hint: "",
+    }
+}
+
+fn probe_rs_tool() -> DoctorTool {
+    DoctorTool {
+        name: "probe-rs",
+        command: "probe-rs",
+        args: &["--version"],
+        install_package: Some("probe-rs-tools"),
+        install_hint: "",
+    }
+}
+
+fn espflash_tool() -> DoctorTool {
+    DoctorTool {
+        name: "espflash",
+        command: "espflash",
+        args: &["--version"],
+        install_package: Some("espflash"),
+        install_hint: "",
+    }
+}
+
+fn esp_config_tool() -> DoctorTool {
+    DoctorTool {
+        name: "esp-config",
+        command: "esp-config",
+        args: &["--version"],
+        install_package: Some("esp-config"),
+        install_hint: "",
+    }
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let args = env::args().collect::<Vec<_>>();
+    if maybe_print_new_help(&args)? {
+        return Ok(());
+    }
+    let cli = Cli::parse_from(args);
     match cli.command {
         Commands::New {
             esp_generate_bin,
+            install_missing,
             name,
             no_vscode_option,
             add_probe_rs_option,
@@ -199,6 +309,7 @@ fn main() -> Result<()> {
             esp_generate_args,
         } => cmd_new(NewCommandOptions {
             esp_generate_bin,
+            install_missing,
             name_override: name,
             esp_generate_args,
             add_vscode_option: !no_vscode_option,
@@ -214,16 +325,348 @@ fn main() -> Result<()> {
             dry_run,
             backup,
         } => {
+            preflight_patch()?;
             let project = canonicalize_lossy(&project)?;
             patch_existing_project(&project, chip, bin, PatchOptions { dry_run, backup })
         }
-        Commands::Doctor { strict } => cmd_doctor(strict),
+        Commands::Doctor {
+            strict,
+            fix,
+            json_output,
+        } => cmd_doctor(strict, fix, json_output),
     }
+}
+
+fn maybe_print_new_help(args: &[String]) -> Result<bool> {
+    if !is_new_help_request(args) {
+        return Ok(false);
+    }
+
+    let mut command = Cli::command();
+    if let Some(subcommand) = command.find_subcommand_mut("new") {
+        subcommand.print_help()?;
+        println!();
+        println!();
+        print_upstream_help(extract_esp_generate_bin_from_help_args(args).as_deref())?;
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn is_new_help_request(args: &[String]) -> bool {
+    match args.get(1).map(String::as_str) {
+        Some("new") => args
+            .iter()
+            .skip(2)
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help")),
+        Some("help") => matches!(args.get(2).map(String::as_str), Some("new")),
+        _ => false,
+    }
+}
+
+fn extract_esp_generate_bin_from_help_args(args: &[String]) -> Option<String> {
+    if !matches!(args.get(1).map(String::as_str), Some("new")) {
+        return None;
+    }
+
+    let mut iter = args.iter().skip(2).peekable();
+    while let Some(arg) = iter.next() {
+        if arg == "--" || arg == "--help" || arg == "-h" {
+            break;
+        }
+        match arg.as_str() {
+            "--esp-generate-bin" => {
+                if let Some(value) = iter.next() {
+                    return Some(value.clone());
+                }
+            }
+            value if value.starts_with("--esp-generate-bin=") => {
+                return value.split_once('=').map(|(_, rhs)| rhs.to_owned());
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn print_upstream_help(esp_generate_bin: Option<&str>) -> Result<()> {
+    let esp_generate_bin = esp_generate_bin.unwrap_or("esp-generate");
+    println!(
+        "Forwarded `esp-generate` help (`{} --help`):",
+        esp_generate_bin
+    );
+    println!();
+
+    match Command::new(esp_generate_bin).arg("--help").output() {
+        Ok(output) if output.status.success() => {
+            let text = if output.stdout.is_empty() {
+                String::from_utf8_lossy(&output.stderr).into_owned()
+            } else {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            };
+            print!("{text}");
+            if !text.ends_with('\n') {
+                println!();
+            }
+        }
+        Ok(output) => {
+            let detail =
+                summarize_command_output(&output).unwrap_or_else(|| "no output".to_owned());
+            println!(
+                "(could not load upstream help from `{}`: command failed with {:?}: {})",
+                esp_generate_bin,
+                output.status.code(),
+                detail
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!(
+                "(could not load upstream help because `{}` was not found. Install it with `{}` or pass `--esp-generate-bin <path>`.)",
+                esp_generate_bin,
+                cargo_install_command("esp-generate")
+            );
+        }
+        Err(error) => {
+            println!(
+                "(could not load upstream help from `{}`: {})",
+                esp_generate_bin, error
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn preflight_new(
+    esp_generate_bin: &str,
+    patch_after_generate: bool,
+    expect_probe_rs_workflow: bool,
+    install_missing: bool,
+) -> Result<()> {
+    ensure_esp_generate_available(
+        esp_generate_bin,
+        default_install_disposition(install_missing),
+    )?;
+    if patch_after_generate {
+        ensure_tool_available(cargo_tool(), InstallDisposition::Never)?;
+    }
+    if expect_probe_rs_workflow {
+        warn_if_probe_rs_missing();
+    }
+    Ok(())
+}
+
+fn preflight_patch() -> Result<()> {
+    ensure_tool_available(cargo_tool(), InstallDisposition::Never)?;
+    warn_if_probe_rs_missing();
+    Ok(())
+}
+
+fn default_install_disposition(install_missing: bool) -> InstallDisposition {
+    if install_missing {
+        InstallDisposition::Auto
+    } else if can_prompt_install() {
+        InstallDisposition::Prompt
+    } else {
+        InstallDisposition::Never
+    }
+}
+
+fn default_fix_disposition(fix: bool) -> InstallDisposition {
+    if !fix {
+        InstallDisposition::Never
+    } else if can_prompt_install() {
+        InstallDisposition::Prompt
+    } else {
+        InstallDisposition::Auto
+    }
+}
+
+fn ensure_esp_generate_available(
+    esp_generate_bin: &str,
+    install_disposition: InstallDisposition,
+) -> Result<()> {
+    if esp_generate_bin == "esp-generate" {
+        return ensure_tool_available(esp_generate_tool(), install_disposition);
+    }
+
+    match probe_command(esp_generate_bin, &["--version"]) {
+        ToolProbe::Available(_) => Ok(()),
+        ToolProbe::Missing => bail!(
+            "could not find `{}`; verify `--esp-generate-bin` or install `esp-generate` with `{}`",
+            esp_generate_bin,
+            cargo_install_command("esp-generate")
+        ),
+        ToolProbe::Error(detail) => {
+            bail!(
+                "failed to run `{}` before generation: {}",
+                esp_generate_bin,
+                detail
+            )
+        }
+    }
+}
+
+fn ensure_tool_available(tool: DoctorTool, install_disposition: InstallDisposition) -> Result<()> {
+    match probe_command(tool.command, tool.args) {
+        ToolProbe::Available(_) => Ok(()),
+        ToolProbe::Error(detail) => {
+            bail!("required tool `{}` is not usable: {}", tool.command, detail)
+        }
+        ToolProbe::Missing => {
+            if maybe_install_tool(tool, install_disposition)? {
+                match probe_command(tool.command, tool.args) {
+                    ToolProbe::Available(_) => Ok(()),
+                    ToolProbe::Missing => bail!(
+                        "`{}` was installed but is still unavailable on PATH. {}",
+                        tool.command,
+                        cargo_bin_path_guidance()
+                    ),
+                    ToolProbe::Error(detail) => bail!(
+                        "`{}` was installed, but verification failed: {}",
+                        tool.command,
+                        detail
+                    ),
+                }
+            } else {
+                bail!("{}", tool_missing_detail(tool))
+            }
+        }
+    }
+}
+
+fn maybe_install_tool(tool: DoctorTool, install_disposition: InstallDisposition) -> Result<bool> {
+    let Some(package) = tool.install_package else {
+        return Ok(false);
+    };
+
+    match install_disposition {
+        InstallDisposition::Never => Ok(false),
+        InstallDisposition::Prompt => {
+            let prompt = format!(
+                "`{}` is missing. Install it now with `{}`?",
+                tool.command,
+                cargo_install_command(package)
+            );
+            if !prompt_yes_no(&prompt)? {
+                return Ok(false);
+            }
+            install_cargo_package(package, tool.name)?;
+            Ok(true)
+        }
+        InstallDisposition::Auto => {
+            install_cargo_package(package, tool.name)?;
+            Ok(true)
+        }
+    }
+}
+
+fn install_cargo_package(package: &str, tool_name: &str) -> Result<()> {
+    ensure_tool_available(cargo_tool(), InstallDisposition::Never)?;
+    println!(
+        "installing `{}` via `{}` ...",
+        tool_name,
+        cargo_install_command(package)
+    );
+    let status = Command::new("cargo")
+        .args(["install", package, "--locked"])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("failed to launch `cargo install {package} --locked`"))?;
+    if !status.success() {
+        bail!("`cargo install {package} --locked` exited with status {status}");
+    }
+    Ok(())
+}
+
+fn warn_if_probe_rs_missing() {
+    match probe_command(probe_rs_tool().command, probe_rs_tool().args) {
+        ToolProbe::Available(_) => {}
+        ToolProbe::Missing => eprintln!(
+            "warning: `probe-rs` is not installed. VS Code debug configs will be created, but flash/debug actions will not work until you install it with `{}`.",
+            cargo_install_command("probe-rs-tools")
+        ),
+        ToolProbe::Error(detail) => eprintln!(
+            "warning: `probe-rs` is installed but could not be verified: {}",
+            detail
+        ),
+    }
+}
+
+fn probe_command(command: &str, args: &[&str]) -> ToolProbe {
+    let output = Command::new(command).args(args).output();
+    match output {
+        Ok(output) if output.status.success() => ToolProbe::Available(
+            summarize_command_output(&output).unwrap_or_else(|| "ok".to_owned()),
+        ),
+        Ok(output) => ToolProbe::Error(format!(
+            "command failed (exit {:?}): {}",
+            output.status.code(),
+            summarize_command_output(&output).unwrap_or_else(|| "no output".to_owned())
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ToolProbe::Missing,
+        Err(error) => ToolProbe::Error(error.to_string()),
+    }
+}
+
+fn cargo_install_command(package: &str) -> String {
+    format!("cargo install {package} --locked")
+}
+
+fn tool_missing_detail(tool: DoctorTool) -> String {
+    match tool.install_package {
+        Some(package) => format!(
+            "{} is not installed or not on PATH; install it with `{}`",
+            tool.command,
+            cargo_install_command(package)
+        ),
+        None if !tool.install_hint.is_empty() => format!(
+            "{} is not installed or not on PATH; see {}",
+            tool.command, tool.install_hint
+        ),
+        None => format!("{} is not installed or not on PATH", tool.command),
+    }
+}
+
+fn cargo_bin_path_guidance() -> String {
+    detect_cargo_bin_dir()
+        .map(|path| {
+            format!(
+                "Ensure Cargo bin is on PATH (expected {}). You may need to open a new terminal.",
+                path.display()
+            )
+        })
+        .unwrap_or_else(|| "Ensure Cargo bin is on PATH and open a new terminal.".to_owned())
+}
+
+fn can_prompt_install() -> bool {
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    print!("{prompt} [y/N]: ");
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read confirmation from stdin")?;
+
+    Ok(matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 fn cmd_new(options: NewCommandOptions) -> Result<()> {
     let NewCommandOptions {
         esp_generate_bin,
+        install_missing,
         name_override,
         mut esp_generate_args,
         add_vscode_option,
@@ -245,6 +688,12 @@ fn cmd_new(options: NewCommandOptions) -> Result<()> {
     }
 
     let generate_context = infer_generate_context(&esp_generate_args)?;
+    preflight_new(
+        &esp_generate_bin,
+        patch_after_generate,
+        patch_after_generate || add_probe_rs_option,
+        install_missing,
+    )?;
     fs::create_dir_all(&generate_context.output_dir).with_context(|| {
         format!(
             "failed to create esp-generate output directory {}",
@@ -291,85 +740,105 @@ fn cmd_new(options: NewCommandOptions) -> Result<()> {
     )
 }
 
-fn cmd_doctor(strict: bool) -> Result<()> {
-    let required_tools = [
-        DoctorTool {
-            name: "rustc",
-            command: "rustc",
-            args: &["--version"],
-            required: true,
-        },
-        DoctorTool {
-            name: "cargo",
-            command: "cargo",
-            args: &["--version"],
-            required: true,
-        },
-        DoctorTool {
-            name: "esp-generate",
-            command: "esp-generate",
-            args: &["--version"],
-            required: true,
-        },
-    ];
-    let optional_tools = [
-        DoctorTool {
-            name: "probe-rs",
-            command: "probe-rs",
-            args: &["--version"],
-            required: false,
-        },
-        DoctorTool {
-            name: "espflash",
-            command: "espflash",
-            args: &["--version"],
-            required: false,
-        },
-        DoctorTool {
-            name: "esp-config",
-            command: "esp-config",
-            args: &["--version"],
-            required: false,
-        },
-    ];
+fn cmd_doctor(strict: bool, fix: bool, json_output: bool) -> Result<()> {
+    let required_tools = [rustc_tool(), cargo_tool(), esp_generate_tool()];
+    let optional_tools = [probe_rs_tool(), espflash_tool(), esp_config_tool()];
+    let install_disposition = default_fix_disposition(fix);
 
-    println!("espwrap doctor");
+    if !json_output {
+        println!("espwrap doctor");
+    }
+
+    let mut reports = Vec::new();
+    for tool in &required_tools {
+        let (status, detail) = check_tool(*tool, true, install_disposition);
+        reports.push(DoctorCheckReport {
+            name: tool.name.to_owned(),
+            status,
+            detail,
+            required: true,
+        });
+    }
+    for tool in &optional_tools {
+        let (status, detail) = check_tool(*tool, false, install_disposition);
+        reports.push(DoctorCheckReport {
+            name: tool.name.to_owned(),
+            status,
+            detail,
+            required: false,
+        });
+    }
+    let (probe_status, probe_detail) = check_probe_scan();
+    reports.push(DoctorCheckReport {
+        name: "probe-scan".to_owned(),
+        status: probe_status,
+        detail: probe_detail,
+        required: false,
+    });
+    let (path_status, path_detail) = check_cargo_bin_on_path();
+    reports.push(DoctorCheckReport {
+        name: "path".to_owned(),
+        status: path_status,
+        detail: path_detail,
+        required: false,
+    });
+
     let mut failures = 0usize;
     let mut warnings = 0usize;
-
-    for tool in required_tools.iter().chain(optional_tools.iter()) {
-        let (status, detail) = check_tool(*tool);
-        print_doctor_line(status, tool.name, &detail);
-        match status {
+    for report in &reports {
+        if !json_output {
+            print_doctor_line(report.status, &report.name, &report.detail);
+        }
+        match report.status {
             DoctorStatus::Fail => failures += 1,
             DoctorStatus::Warn => warnings += 1,
             DoctorStatus::Ok => {}
         }
     }
 
-    let (probe_status, probe_detail) = check_probe_scan();
-    print_doctor_line(probe_status, "probe-scan", &probe_detail);
-    match probe_status {
-        DoctorStatus::Fail => failures += 1,
-        DoctorStatus::Warn => warnings += 1,
-        DoctorStatus::Ok => {}
+    if json_output {
+        print_doctor_json(&reports, failures, warnings, strict)?;
+    } else {
+        println!("summary: failures={failures}, warnings={warnings}");
     }
 
-    let (path_status, path_detail) = check_cargo_bin_on_path();
-    print_doctor_line(path_status, "path", &path_detail);
-    match path_status {
-        DoctorStatus::Fail => failures += 1,
-        DoctorStatus::Warn => warnings += 1,
-        DoctorStatus::Ok => {}
-    }
-
-    println!("summary: failures={failures}, warnings={warnings}");
     if failures > 0 {
         bail!("doctor found {failures} blocking issue(s)");
     }
     if strict && warnings > 0 {
         bail!("doctor strict mode failed due to {warnings} warning(s)");
     }
+    Ok(())
+}
+
+fn print_doctor_json(
+    reports: &[DoctorCheckReport],
+    failures: usize,
+    warnings: usize,
+    strict: bool,
+) -> Result<()> {
+    let ok = failures == 0 && (!strict || warnings == 0);
+    let checks = reports
+        .iter()
+        .map(|report| {
+            json!({
+                "name": report.name.as_str(),
+                "status": report.status.as_str(),
+                "detail": report.detail.as_str(),
+                "required": report.required,
+            })
+        })
+        .collect::<Vec<_>>();
+    let payload = json!({
+        "checks": checks,
+        "summary": {
+            "failures": failures,
+            "warnings": warnings,
+            "strict": strict,
+            "ok": ok,
+        }
+    });
+    println!("{}", serde_json::to_string_pretty(&payload)?);
     Ok(())
 }
 
@@ -411,7 +880,10 @@ fn inspect_project(
     let root = canonicalize_lossy(project_root)?;
     let manifest_path = root.join("Cargo.toml");
     if !manifest_path.exists() {
-        bail!("{} does not contain a Cargo.toml", root.display());
+        bail!(
+            "patch requires a Cargo project root, but {} does not contain a Cargo.toml",
+            root.display()
+        );
     }
 
     let metadata = cargo_metadata(&manifest_path)?;
@@ -458,15 +930,23 @@ fn cargo_metadata(manifest_path: &Path) -> Result<CargoMetadata> {
         .context("failed to run `cargo metadata`")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("`cargo metadata` failed: {stderr}");
+        bail!(
+            "`cargo metadata` failed for {}: {}",
+            manifest_path.display(),
+            stderr.trim()
+        );
     }
     serde_json::from_slice(&output.stdout).context("failed to parse `cargo metadata` JSON")
 }
 
 fn detect_target_triple(project_root: &Path) -> Result<String> {
     let config_path = project_root.join(".cargo").join("config.toml");
-    let text = fs::read_to_string(&config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let text = fs::read_to_string(&config_path).with_context(|| {
+        format!(
+            "failed to read {}. Expected an ESP project with `.cargo/config.toml`",
+            config_path.display()
+        )
+    })?;
     let value: toml::Value = toml::from_str(&text)
         .with_context(|| format!("failed to parse {}", config_path.display()))?;
     value
@@ -474,7 +954,12 @@ fn detect_target_triple(project_root: &Path) -> Result<String> {
         .and_then(|value| value.get("target"))
         .and_then(toml::Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| anyhow!("could not find [build].target in {}", config_path.display()))
+        .ok_or_else(|| {
+            anyhow!(
+                "could not find [build].target in {}. Expected an ESP project generated with a target triple",
+                config_path.display()
+            )
+        })
 }
 
 fn detect_chip(package: &MetadataPackage) -> Result<&'static str> {
@@ -997,39 +1482,54 @@ fn infer_generated_project_from_snapshot(
     }
 }
 
-fn check_tool(tool: DoctorTool) -> (DoctorStatus, String) {
-    let output = Command::new(tool.command).args(tool.args).output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let detail = summarize_command_output(&output).unwrap_or_else(|| "ok".to_owned());
-            (DoctorStatus::Ok, detail)
-        }
-        Ok(output) => {
-            let detail = format!(
-                "command failed (exit {:?}): {}",
-                output.status.code(),
-                summarize_command_output(&output).unwrap_or_else(|| "no output".to_owned())
-            );
-            if tool.required {
-                (DoctorStatus::Fail, detail)
+fn check_tool(
+    tool: DoctorTool,
+    required: bool,
+    install_disposition: InstallDisposition,
+) -> (DoctorStatus, String) {
+    let missing_status = if required {
+        DoctorStatus::Fail
+    } else {
+        DoctorStatus::Warn
+    };
+
+    match probe_command(tool.command, tool.args) {
+        ToolProbe::Available(detail) => (DoctorStatus::Ok, detail),
+        ToolProbe::Error(detail) => (missing_status, detail),
+        ToolProbe::Missing => {
+            if tool.install_package.is_some()
+                && !matches!(install_disposition, InstallDisposition::Never)
+            {
+                match maybe_install_tool(tool, install_disposition) {
+                    Ok(true) => match probe_command(tool.command, tool.args) {
+                        ToolProbe::Available(detail) => (
+                            DoctorStatus::Ok,
+                            format!("installed successfully; {detail}"),
+                        ),
+                        ToolProbe::Missing => (
+                            missing_status,
+                            format!(
+                                "`{}` was installed but is still unavailable on PATH. {}",
+                                tool.command,
+                                cargo_bin_path_guidance()
+                            ),
+                        ),
+                        ToolProbe::Error(detail) => (
+                            missing_status,
+                            format!(
+                                "`{}` was installed, but verification failed: {detail}",
+                                tool.command
+                            ),
+                        ),
+                    },
+                    Ok(false) => (missing_status, tool_missing_detail(tool)),
+                    Err(error) => (
+                        missing_status,
+                        format!("failed to install `{}`: {error}", tool.command),
+                    ),
+                }
             } else {
-                (DoctorStatus::Warn, detail)
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let detail = format!("{} is not installed or not on PATH", tool.command);
-            if tool.required {
-                (DoctorStatus::Fail, detail)
-            } else {
-                (DoctorStatus::Warn, detail)
-            }
-        }
-        Err(error) => {
-            let detail = format!("failed to run {}: {error}", tool.command);
-            if tool.required {
-                (DoctorStatus::Fail, detail)
-            } else {
-                (DoctorStatus::Warn, detail)
+                (missing_status, tool_missing_detail(tool))
             }
         }
     }
@@ -1159,9 +1659,11 @@ fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PatchOptions, apply_name_override, create_backup, has_option, infer_generate_context,
-        infer_generated_project_from_snapshot, write_json_update,
+        Cli, Commands, PatchOptions, apply_name_override, cargo_install_command, create_backup,
+        has_option, infer_generate_context, infer_generated_project_from_snapshot, rustc_tool,
+        tool_missing_detail, write_json_update,
     };
+    use clap::Parser;
     use serde_json::{Map, Value};
     use std::{
         collections::BTreeSet,
@@ -1169,6 +1671,74 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    #[test]
+    fn parses_new_install_missing_flag() {
+        let cli = Cli::try_parse_from(["espwrap", "new", "--install-missing", "--name", "demo"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::New {
+                install_missing,
+                name,
+                ..
+            } => {
+                assert!(install_missing);
+                assert_eq!(name.as_deref(), Some("demo"));
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_doctor_fix_flag() {
+        let cli =
+            Cli::try_parse_from(["espwrap", "doctor", "--fix"]).expect("cli parse should succeed");
+        match cli.command {
+            Commands::Doctor {
+                fix,
+                strict,
+                json_output,
+            } => {
+                assert!(fix);
+                assert!(!strict);
+                assert!(!json_output);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_doctor_json_flag() {
+        let cli =
+            Cli::try_parse_from(["espwrap", "doctor", "--json"]).expect("cli parse should succeed");
+        match cli.command {
+            Commands::Doctor {
+                fix,
+                strict,
+                json_output,
+            } => {
+                assert!(!fix);
+                assert!(!strict);
+                assert!(json_output);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn formats_cargo_install_commands() {
+        assert_eq!(
+            cargo_install_command("esp-generate"),
+            "cargo install esp-generate --locked"
+        );
+    }
+
+    #[test]
+    fn missing_tool_detail_uses_url_for_rust_tools() {
+        let detail = tool_missing_detail(rustc_tool());
+        assert!(detail.contains("rustc is not installed"));
+        assert!(detail.contains("https://rustup.rs/"));
+    }
 
     #[test]
     fn detects_auto_added_options() {
