@@ -1,0 +1,138 @@
+{
+  "name": "espwrap-vscode",
+  "displayName": "ESP Wrap",
+  "description": "VS Code companion for espwrap, focused on Rust on ESP project generation, patching, and diagnostics.",
+  "version": "0.2.0",
+  "private": true,
+  "publisher": "hxqingxin12138",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HXqingxin0601/esp23-wraper.git"
+  },
+  "homepage": "https://github.com/HXqingxin0601/esp23-wraper",
+  "bugs": {
+    "url": "https://github.com/HXqingxin0601/esp23-wraper/issues"
+  },
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Debuggers",
+    "Other"
+  ],
+  "keywords": [
+    "esp32",
+    "rust",
+    "esp-rs",
+    "probe-rs",
+    "embedded"
+  ],
+  "activationEvents": [
+    "onView:espwrap.home",
+    "onCommand:espwrap.newProject",
+    "onCommand:espwrap.patchCurrentWorkspace",
+    "onCommand:espwrap.doctor"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "espwrap",
+          "title": "ESP Wrap",
+          "icon": "media/espwrap-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "espwrap": [
+        {
+          "type": "webview",
+          "id": "espwrap.home",
+          "name": "Home"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "espwrap.openHome",
+        "title": "ESP Wrap: Open Sidebar",
+        "category": "ESP Wrap"
+      },
+      {
+        "command": "espwrap.newProject",
+        "title": "ESP Wrap: New Rust Project",
+        "category": "ESP Wrap"
+      },
+      {
+        "command": "espwrap.patchCurrentWorkspace",
+        "title": "ESP Wrap: Patch Current Workspace",
+        "category": "ESP Wrap"
+      },
+      {
+        "command": "espwrap.doctor",
+        "title": "ESP Wrap: Run Doctor",
+        "category": "ESP Wrap"
+      }
+    ],
+    "configuration": {
+      "title": "ESP Wrap",
+      "properties": {
+        "espwrap.binaryPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional explicit path or command name for the espwrap CLI binary. Leave blank to auto-detect the bundled build, local repo build, or PATH."
+        },
+        "espwrap.defaultOpenBehavior": {
+          "type": "string",
+          "enum": [
+            "ask",
+            "openNewWindow",
+            "addToWorkspace",
+            "doNothing"
+          ],
+          "default": "ask",
+          "description": "What the extension should do after generating a new ESP Rust project."
+        },
+        "espwrap.defaultInstallMissingTools": {
+          "type": "boolean",
+          "default": false,
+          "description": "When enabled, the extension passes --install-missing during project creation so supported missing CLI tools can be installed automatically."
+        },
+        "espwrap.defaultChip": {
+          "type": "string",
+          "enum": [
+            "esp32",
+            "esp32c2",
+            "esp32c3",
+            "esp32c6",
+            "esp32h2",
+            "esp32s2",
+            "esp32s3"
+          ],
+          "default": "esp32c3",
+          "description": "Default chip shown in the new project form."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "clean": "rimraf dist .artifacts .vsix-staging",
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "test": "npm.cmd run compile && node scripts/run-tests.mjs",
+    "prepackage": "npm run clean && npm run compile && npm run test",
+    "package:vsix": "npm run prepackage && node scripts/package-vsix.mjs",
+    "install:vsix": "npm run package:vsix && node scripts/install-local-vsix.mjs",
+    "test:e2e": "npm run prepackage && node scripts/smoke-e2e.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "@types/vscode": "^1.96.0",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

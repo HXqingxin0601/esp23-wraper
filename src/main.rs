@@ -687,7 +687,8 @@ fn cmd_new(options: NewCommandOptions) -> Result<()> {
         esp_generate_args.push("probe-rs".to_owned());
     }
 
-    let generate_context = infer_generate_context(&esp_generate_args)?;
+    let mut generate_context = infer_generate_context(&esp_generate_args)?;
+    generate_context.project_name = name_override.clone();
     preflight_new(
         &esp_generate_bin,
         patch_after_generate,
@@ -1334,8 +1335,7 @@ fn apply_name_override(args: &mut Vec<String>, name_override: Option<&str>) -> R
         return Ok(());
     };
 
-    let inferred = infer_generate_context(args)?;
-    if let Some(existing) = inferred.project_name {
+    if let Some(existing) = infer_generate_name_arg(args)? {
         if existing == name {
             return Ok(());
         }
@@ -1350,9 +1350,7 @@ fn apply_name_override(args: &mut Vec<String>, name_override: Option<&str>) -> R
     Ok(())
 }
 
-fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
-    let mut output_path: Option<PathBuf> = None;
-    let mut chip: Option<String> = None;
+fn infer_generate_name_arg(args: &[String]) -> Result<Option<String>> {
     let mut positionals: Vec<String> = Vec::new();
     let mut iter = args.iter().peekable();
 
@@ -1361,6 +1359,35 @@ fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
             for remaining in iter {
                 positionals.push(remaining.to_owned());
             }
+            break;
+        }
+
+        match arg.as_str() {
+            "-O" | "--output-path" | "-c" | "--chip" | "-o" | "--option" | "--toolchain" => {
+                iter.next()
+                    .ok_or_else(|| anyhow!("{arg} requires a value"))?;
+            }
+            "-s" | "--headless" | "--skip-update-check" => {}
+            value
+                if value.starts_with("--output-path=")
+                    || value.starts_with("--chip=")
+                    || value.starts_with("--option=")
+                    || value.starts_with("--toolchain=") => {}
+            value if value.starts_with('-') => {}
+            value => positionals.push(value.to_owned()),
+        }
+    }
+
+    Ok(positionals.last().cloned())
+}
+
+fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
+    let mut output_path: Option<PathBuf> = None;
+    let mut chip: Option<String> = None;
+    let mut iter = args.iter().peekable();
+
+    while let Some(arg) = iter.next() {
+        if arg == "--" {
             break;
         }
 
@@ -1380,6 +1407,7 @@ fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
             "-o" | "--option" | "--toolchain" => {
                 iter.next();
             }
+            "-s" | "--headless" | "--skip-update-check" => {}
             value if value.starts_with("--output-path=") => {
                 output_path = Some(PathBuf::from(
                     value
@@ -1393,7 +1421,7 @@ fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
             }
             value if value.starts_with("--option=") || value.starts_with("--toolchain=") => {}
             value if value.starts_with('-') => {}
-            value => positionals.push(value.to_owned()),
+            _ => {}
         }
     }
 
@@ -1404,7 +1432,7 @@ fn infer_generate_context(args: &[String]) -> Result<GenerateContext> {
     };
     Ok(GenerateContext {
         output_dir,
-        project_name: positionals.last().cloned(),
+        project_name: None,
         chip,
     })
 }
@@ -1660,8 +1688,8 @@ fn normalize_path(path: &Path) -> String {
 mod tests {
     use super::{
         Cli, Commands, PatchOptions, apply_name_override, cargo_install_command, create_backup,
-        has_option, infer_generate_context, infer_generated_project_from_snapshot, rustc_tool,
-        tool_missing_detail, write_json_update,
+        has_option, infer_generate_context, infer_generate_name_arg,
+        infer_generated_project_from_snapshot, rustc_tool, tool_missing_detail, write_json_update,
     };
     use clap::Parser;
     use serde_json::{Map, Value};
@@ -1756,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn infers_project_dir_and_chip() {
+    fn infers_output_dir_and_chip_without_trusting_positional_name() {
         let args = vec![
             "--headless".to_owned(),
             "--chip".to_owned(),
@@ -1767,12 +1795,12 @@ mod tests {
         ];
         let context = infer_generate_context(&args).expect("context inference should succeed");
         assert_eq!(context.chip.as_deref(), Some("esp32c3"));
-        assert_eq!(context.project_name.as_deref(), Some("demo"));
+        assert_eq!(context.project_name, None);
         assert_eq!(
-            context.output_dir.join("demo"),
+            context.output_dir,
             std::env::current_dir()
                 .unwrap()
-                .join(PathBuf::from("generated").join("demo"))
+                .join(PathBuf::from("generated"))
         );
     }
 
@@ -1812,6 +1840,18 @@ mod tests {
         let error = apply_name_override(&mut args, Some("other"))
             .expect_err("override should fail on conflict");
         assert!(error.to_string().contains("conflicting project names"));
+    }
+
+    #[test]
+    fn detects_forwarded_generate_project_name_when_present() {
+        let args = vec![
+            "--chip".to_owned(),
+            "esp32c3".to_owned(),
+            "--headless".to_owned(),
+            "demo".to_owned(),
+        ];
+        let inferred = infer_generate_name_arg(&args).expect("name inference should succeed");
+        assert_eq!(inferred.as_deref(), Some("demo"));
     }
 
     #[test]

@@ -1,1 +1,6 @@
 /target
+vscode-extension/node_modules/
+vscode-extension/dist/
+vscode-extension/.artifacts/
+vscode-extension/.vsix-staging/
+vscode-extension/*.vsix

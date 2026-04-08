@@ -1,7 +1,8 @@
 # espwrap
 
-`espwrap` is a host-side CLI that wraps `esp-generate` and patches project-local
-VS Code debug configuration for `probe-rs`.
+`espwrap` is a host-side CLI that wraps `esp-generate` for official `no_std`
+ESP Rust templates and patches project-local VS Code debug configuration for
+`probe-rs`.
 
 It only edits files in the target project, never VS Code user/global settings.
 
@@ -25,6 +26,7 @@ It only edits files in the target project, never VS Code user/global settings.
 - Keep existing JSON files and merge updates instead of replacing blindly.
 - Provide diagnostics via `espwrap doctor`.
 - Offer guided installation for supported missing Cargo-installed tools.
+- Include a local VS Code extension for form-based project creation and doctor reports.
 
 ## Commands
 
@@ -33,6 +35,101 @@ espwrap new     # generate + patch
 espwrap patch   # patch an existing project
 espwrap doctor  # verify local toolchain and debug dependencies
 ```
+
+## Template Scope
+
+`espwrap new` currently targets the official `esp-generate` workflow, which is
+the `no_std` template path.
+
+If you want the official `std` / ESP-IDF template instead, use the upstream
+template directly:
+
+```powershell
+cargo generate esp-rs/esp-idf-template cargo
+```
+
+That `std` path is not wrapped by `espwrap new` yet.
+
+## VS Code Extension
+
+This repository now also contains a local VS Code extension in
+[`vscode-extension/`](./vscode-extension). It is intended for local testing and
+development right now, not Marketplace publishing.
+
+What the extension adds:
+
+- A sidebar home in the VS Code activity bar, so the extension feels like a normal tool window instead of command-only entry points
+- A guided "New Rust Project" form with descriptions beside the important options
+- A guided "Patch Current Workspace" form for existing projects
+- A structured "Doctor" panel powered by `espwrap doctor --json`
+- Auto-detection for a bundled CLI, local repo build, or PATH so local testing does not require re-entering `espwrap.binaryPath`
+
+For local extension work, a repo-local `cargo build` is enough to provide the
+CLI. You do not need to globally install `espwrap` first unless you explicitly
+want a PATH-based setup.
+
+### Local Extension Testing
+
+```powershell
+cargo build
+cd vscode-extension
+npm install
+npm run compile
+npm run test
+```
+
+That `cargo build` step is important because it creates the local
+`target/debug/espwrap(.exe)` or `target/release/espwrap(.exe)` binary that the
+extension can detect and use.
+
+Then:
+
+1. Open [`vscode-extension/`](./vscode-extension) as the VS Code workspace.
+2. Press `F5` to launch an Extension Development Host.
+3. In the new VS Code window, click the `ESP Wrap` icon in the activity bar to open the sidebar home.
+
+The repository now includes a ready-made local extension debug profile at
+[`vscode-extension/.vscode/launch.json`](./vscode-extension/.vscode/launch.json),
+so you do not need to create one manually.
+
+If you leave `espwrap.binaryPath` blank, the extension now tries these sources automatically:
+
+1. A bundled CLI inside the installed extension package
+2. A local `target/debug` or `target/release` build near the current workspace
+3. `espwrap` from `PATH`
+
+### Local VSIX Install
+
+If you do not want to keep using `F5`, you can build and install a local `.vsix` package:
+
+```powershell
+cd ..
+cargo build
+cd vscode-extension
+npm run package:vsix
+npm run install:vsix
+```
+
+This packages the extension and bundles the current local `espwrap` binary into
+the VSIX, so the installed extension can use it without asking you to re-enter
+the path each time.
+
+Important packaging notes:
+
+- `npm run package:vsix` does not build the CLI automatically. Run `cargo build`
+  first so there is a binary to bundle.
+- A separate global `espwrap` install is optional when you use a locally built
+  or bundled CLI.
+- The bundled CLI is platform-specific. A Windows-built VSIX contains
+  `espwrap.exe` and is not intended to be reused as the bundled CLI on Linux or
+  macOS. Build on each target OS if you want packaged native binaries there.
+
+Useful local packaging commands:
+
+- `npm run package:vsix`: build `vscode-extension/.artifacts/*.vsix`
+- `npm run install:vsix`: package and install into your local VS Code
+- `npm run test`: run form-model tests plus HTML-based UI smoke tests for the home page and patch form
+- `npm run test:e2e`: smoke-test the produced VSIX archive structure
 
 ## Installation
 
@@ -100,6 +197,9 @@ espwrap --help
 espwrap new --headless --chip esp32c3 --name myproj
 ```
 
+This `new` flow currently wraps the official `esp-generate` `no_std` template
+path. It does not yet generate the official `std` / ESP-IDF template.
+
 If `esp-generate` is missing, `espwrap new` now fails early with a clear install hint.
 In an interactive terminal it can also prompt to install supported missing tools for you.
 
@@ -160,6 +260,10 @@ cd tools\espwrap
 cargo fmt
 cargo build
 cargo test --no-run
+cd vscode-extension
+npm install
+npm run compile
+npm run test
 ```
 
 If your environment blocks running freshly built binaries, `cargo test --no-run`
@@ -168,8 +272,8 @@ still validates compilation of all test targets.
 ## Roadmap
 
 - Add richer `doctor` checks for USB/JTAG drivers per platform.
-- Add optional JSON output mode for CI integrations.
-- Add end-to-end integration tests for generated template projects.
+- Add higher-level integration tests that exercise real VS Code interactions, beyond the current HTML/UI smoke tests.
+- Keep refining the extension UX for Rust-on-ESP workflows in VS Code.
 
 ## License
 

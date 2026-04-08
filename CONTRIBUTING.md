@@ -8,6 +8,10 @@ Thanks for contributing to `espwrap`.
 cargo fmt
 cargo build
 cargo test --no-run
+cd vscode-extension
+npm install
+npm run compile
+npm run test
 ```
 
 If your environment allows running local test binaries, also run:
@@ -16,10 +20,18 @@ If your environment allows running local test binaries, also run:
 cargo test
 ```
 
+If you touch the VS Code extension packaging flow, also run:
+
+```bash
+cd vscode-extension
+npm run test:e2e
+```
+
 ## Pull request checklist
 
 - Keep behavior changes covered by tests when possible.
 - Run formatting and build checks before opening PR.
+- Run `npm run test` in `vscode-extension` when you touch the extension.
 - Update `README.md` when CLI behavior or flags change.
 - Update `CHANGELOG.md` for user-visible changes.
 

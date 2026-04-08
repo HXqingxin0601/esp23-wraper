@@ -83,6 +83,45 @@ fn patch_empty_directory_reports_cargo_project_requirement() {
         ));
 }
 
+#[test]
+fn patch_writes_expected_vscode_files_for_valid_project() {
+    let temp = tempdir().expect("temp dir should exist");
+    write_patchable_project(temp.path());
+
+    Command::cargo_bin("espwrap")
+        .expect("binary should build")
+        .args([
+            "patch",
+            temp.path().to_str().expect("path should be utf-8"),
+            "--chip",
+            "esp32c3",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("4 files changed, 0 unchanged"))
+        .stdout(predicate::str::contains("chip: esp32c3"));
+
+    let settings = fs::read_to_string(temp.path().join(".vscode").join("settings.json"))
+        .expect("settings should exist");
+    assert!(settings.contains("\"rust-analyzer.cargo.target\": \"riscv32imc-unknown-none-elf\""));
+
+    let tasks = fs::read_to_string(temp.path().join(".vscode").join("tasks.json"))
+        .expect("tasks should exist");
+    assert!(tasks.contains("\"label\": \"espwrap: cargo build\""));
+
+    let launch = fs::read_to_string(temp.path().join(".vscode").join("launch.json"))
+        .expect("launch should exist");
+    assert!(launch.contains("\"name\": \"espwrap: Flash + Debug\""));
+    assert!(launch.contains("\"chip\": \"esp32c3\""));
+    assert!(
+        launch.contains("\"programBinary\": \"target/riscv32imc-unknown-none-elf/debug/demo\"")
+    );
+
+    let extensions = fs::read_to_string(temp.path().join(".vscode").join("extensions.json"))
+        .expect("extensions should exist");
+    assert!(extensions.contains("\"probe-rs.probe-rs-debugger\""));
+}
+
 fn write_fake_generator_help(root: &Path) -> std::path::PathBuf {
     if cfg!(windows) {
         let path = root.join("fake-esp-generate.cmd");
@@ -111,4 +150,20 @@ fn write_fake_generator_help(root: &Path) -> std::path::PathBuf {
         }
         path
     }
+}
+
+fn write_patchable_project(root: &Path) {
+    fs::create_dir_all(root.join("src")).expect("should create src directory");
+    fs::create_dir_all(root.join(".cargo")).expect("should create cargo config directory");
+    fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[[bin]]\nname = \"demo\"\npath = \"src/main.rs\"\n",
+    )
+    .expect("should write Cargo.toml");
+    fs::write(root.join("src").join("main.rs"), "fn main() {}\n").expect("should write main.rs");
+    fs::write(
+        root.join(".cargo").join("config.toml"),
+        "[build]\ntarget = \"riscv32imc-unknown-none-elf\"\n",
+    )
+    .expect("should write cargo config");
 }
