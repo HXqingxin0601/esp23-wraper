@@ -8,14 +8,24 @@ fn doctor_json_outputs_parseable_report() {
     let output = Command::cargo_bin("espwrap")
         .expect("binary should build")
         .args(["doctor", "--json"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
+        .output()
+        .expect("doctor --json should run");
+
+    assert!(
+        output.status.success() || output.status.code() == Some(1),
+        "doctor --json should exit with 0 or 1, got {:?}",
+        output.status.code()
+    );
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("doctor found"),
+            "expected doctor failure detail in stderr, got: {stderr}"
+        );
+    }
 
     let value: serde_json::Value =
-        serde_json::from_slice(&output).expect("doctor --json should emit valid JSON");
+        serde_json::from_slice(&output.stdout).expect("doctor --json should emit valid JSON");
     let checks = value["checks"]
         .as_array()
         .expect("checks should be an array");
