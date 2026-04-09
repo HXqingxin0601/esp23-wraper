@@ -122,7 +122,7 @@
     "clean": "rimraf dist .artifacts .vsix-staging",
     "compile": "tsc -p .",
     "watch": "tsc -w -p .",
-    "test": "npm.cmd run compile && node scripts/run-tests.mjs",
+    "test": "npm run compile && node scripts/run-tests.mjs",
     "prepackage": "npm run clean && npm run compile && npm run test",
     "package:vsix": "npm run prepackage && node scripts/package-vsix.mjs",
     "install:vsix": "npm run package:vsix && node scripts/install-local-vsix.mjs",
