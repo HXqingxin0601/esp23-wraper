@@ -8,6 +8,7 @@ import { ensureEspwrapCapabilities, runEspwrapCommand } from "./espwrapCli";
 import {
   BLE_OPTIONS,
   CHIP_OPTIONS,
+  DEBUG_BACKEND_OPTIONS,
   PRESET_DEFINITIONS,
   TOGGLE_FIELDS,
   applyPreset,
@@ -16,11 +17,13 @@ import {
   resolveOutputPath,
   type BleMode,
   type BuildCommandOptions,
+  type DebugBackend,
   type EspChip,
   type NewProjectFormState,
   type ProjectPreset,
   validateNewProjectState,
 } from "./formModel";
+import { serializeWebviewPayload } from "./webviewJson";
 
 export async function openNewProjectPanel(
   context: vscode.ExtensionContext,
@@ -243,6 +246,7 @@ function getHtml(webview: vscode.Webview, extensionUri: vscode.Uri, state: NewPr
       presets: PRESET_DEFINITIONS,
       toggles: TOGGLE_FIELDS,
       bleOptions: BLE_OPTIONS,
+      debugBackends: DEBUG_BACKEND_OPTIONS,
       presetStates: Object.fromEntries(
         PRESET_DEFINITIONS.map((preset) => [preset.id, applyPreset(state, preset.id)])
       ),
@@ -293,7 +297,7 @@ function getHtml(webview: vscode.Webview, extensionUri: vscode.Uri, state: NewPr
               <button type="button" id="pickOutputPath" class="secondary">Browse...</button>
             </div>
           </div>
-          <div class="split">
+          <div class="split basics-split">
             <div class="field">
               <label for="chip">Chip</label>
               <p>Pick the target chip so the template can use the right architecture and defaults.</p>
@@ -309,6 +313,13 @@ function getHtml(webview: vscode.Webview, extensionUri: vscode.Uri, state: NewPr
               </select>
             </div>
           </div>
+          <div class="field">
+            <label for="debugBackend">Debug Backend</label>
+            <p>Choose whether espwrap should generate <code>probe-rs</code>, <code>OpenOCD + GDB</code>, or no managed debug configuration.</p>
+            <select id="debugBackend">
+              ${DEBUG_BACKEND_OPTIONS.map((backend) => renderOption(backend, renderDebugBackendLabel(backend), state.debugBackend === backend)).join("")}
+            </select>
+          </div>
           <div id="presetDescription" class="preset-description"></div>
         </section>
 
@@ -317,7 +328,7 @@ function getHtml(webview: vscode.Webview, extensionUri: vscode.Uri, state: NewPr
           <div class="option-grid">
             ${TOGGLE_FIELDS.filter((field) => !field.advanced).map((field) => renderCheckbox(field, state)).join("")}
           </div>
-          <div class="field">
+          <div class="field ble-stack-field">
             <label for="bleMode">BLE Stack</label>
             <p>Choose a BLE template only if you actually plan to use Bluetooth in this project.</p>
             <select id="bleMode">
@@ -346,6 +357,11 @@ function getHtml(webview: vscode.Webview, extensionUri: vscode.Uri, state: NewPr
                 <input id="extraEspwrapArgs" type="text" value="${escapeHtml(state.extraEspwrapArgs)}" />
               </div>
               <div class="field">
+                <label for="openocdConfigs">OpenOCD Config Files</label>
+                <p>Optional when <code>Debug Backend</code> is <code>OpenOCD + GDB</code>. Enter one config file per line, for example <code>interface/ftdi/esp32_devkitj_v1.cfg</code>.</p>
+                <textarea id="openocdConfigs" rows="3">${escapeHtml(state.openocdConfigs)}</textarea>
+              </div>
+              <div class="field">
                 <label for="extraGenerateArgs">Extra esp-generate Args</label>
                 <p>Append raw esp-generate flags after <code>--</code> when the built-in form is not enough. Form-managed flags like <code>--chip</code> and <code>--output-path</code> stay locked to the controls above.</p>
                 <textarea id="extraGenerateArgs" rows="3">${escapeHtml(state.extraGenerateArgs)}</textarea>
@@ -367,7 +383,7 @@ function getHtml(webview: vscode.Webview, extensionUri: vscode.Uri, state: NewPr
       </main>
     </div>
 
-    <script id="espwrap-data" type="application/json">${escapeHtml(JSON.stringify(payload))}</script>
+    <script id="espwrap-data" type="application/json">${serializeWebviewPayload(payload)}</script>
     <script nonce="${nonce}" src="${scriptUri}"></script>
   </body>
 </html>`;
@@ -386,6 +402,17 @@ function renderCheckbox(field: { key: string; label: string; description: string
 
 function renderOption(value: string, label: string, selected: boolean): string {
   return `<option value="${escapeHtml(value)}" ${selected ? "selected" : ""}>${escapeHtml(label)}</option>`;
+}
+
+function renderDebugBackendLabel(value: DebugBackend): string {
+  switch (value) {
+    case "probe-rs":
+      return "probe-rs";
+    case "openocd":
+      return "OpenOCD + GDB";
+    case "none":
+      return "None";
+  }
 }
 
 function escapeHtml(value: string): string {
@@ -425,13 +452,18 @@ function normalizeState(value: unknown): NewProjectFormState | null {
   const bleMode = typeof value.bleMode === "string" && BLE_OPTIONS.includes(value.bleMode as BleMode)
     ? (value.bleMode as BleMode)
     : "none";
+  const debugBackend =
+    typeof value.debugBackend === "string" && DEBUG_BACKEND_OPTIONS.includes(value.debugBackend as DebugBackend)
+      ? (value.debugBackend as DebugBackend)
+      : "probe-rs";
 
   return {
     name: stringValue(value.name),
     outputPath: stringValue(value.outputPath),
     chip,
     preset,
-    probeRs: booleanValue(value.probeRs),
+    debugBackend,
+    openocdConfigs: stringValue(value.openocdConfigs),
     embassy: booleanValue(value.embassy),
     alloc: booleanValue(value.alloc),
     wifi: booleanValue(value.wifi),

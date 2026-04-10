@@ -74,6 +74,7 @@ fn new_help_includes_wrapped_and_upstream_flags() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--install-missing"))
+        .stdout(predicate::str::contains("--debug-backend"))
         .stdout(predicate::str::contains("Forwarded `esp-generate` help"))
         .stdout(predicate::str::contains("MOCK ESP-GENERATE HELP"))
         .stdout(predicate::str::contains("--headless"));
@@ -109,7 +110,8 @@ fn patch_writes_expected_vscode_files_for_valid_project() {
         .assert()
         .success()
         .stdout(predicate::str::contains("4 files changed, 0 unchanged"))
-        .stdout(predicate::str::contains("chip: esp32c3"));
+        .stdout(predicate::str::contains("chip: esp32c3"))
+        .stdout(predicate::str::contains("debug backend: probe-rs"));
 
     let settings = fs::read_to_string(temp.path().join(".vscode").join("settings.json"))
         .expect("settings should exist");
@@ -130,6 +132,135 @@ fn patch_writes_expected_vscode_files_for_valid_project() {
     let extensions = fs::read_to_string(temp.path().join(".vscode").join("extensions.json"))
         .expect("extensions should exist");
     assert!(extensions.contains("\"probe-rs.probe-rs-debugger\""));
+    assert!(!extensions.contains("\"marus25.cortex-debug\""));
+}
+
+#[test]
+fn patch_writes_openocd_vscode_files_when_requested() {
+    let temp = tempdir().expect("temp dir should exist");
+    write_patchable_project(temp.path());
+
+    Command::cargo_bin("espwrap")
+        .expect("binary should build")
+        .args([
+            "patch",
+            temp.path().to_str().expect("path should be utf-8"),
+            "--chip",
+            "esp32c3",
+            "--debug-backend",
+            "openocd",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("debug backend: openocd"));
+
+    let launch = fs::read_to_string(temp.path().join(".vscode").join("launch.json"))
+        .expect("launch should exist");
+    assert!(launch.contains("\"type\": \"cortex-debug\""));
+    assert!(launch.contains("\"servertype\": \"openocd\""));
+    assert!(launch.contains("\"gdbPath\": \"riscv32-esp-elf-gdb\""));
+    assert!(launch.contains("\"board/esp32c3-builtin.cfg\""));
+    assert!(launch.contains("\"executable\": \"target/riscv32imc-unknown-none-elf/debug/demo\""));
+
+    let extensions = fs::read_to_string(temp.path().join(".vscode").join("extensions.json"))
+        .expect("extensions should exist");
+    assert!(extensions.contains("\"marus25.cortex-debug\""));
+    assert!(!extensions.contains("\"probe-rs.probe-rs-debugger\""));
+}
+
+#[test]
+fn patch_honors_custom_openocd_config_files() {
+    let temp = tempdir().expect("temp dir should exist");
+    write_patchable_project(temp.path());
+
+    Command::cargo_bin("espwrap")
+        .expect("binary should build")
+        .args([
+            "patch",
+            temp.path().to_str().expect("path should be utf-8"),
+            "--chip",
+            "esp32c3",
+            "--debug-backend",
+            "openocd",
+            "--openocd-config",
+            "interface/ftdi/esp32_devkitj_v1.cfg",
+            "--openocd-config",
+            "board/esp32c3-builtin.cfg",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "openocd configs: interface/ftdi/esp32_devkitj_v1.cfg, board/esp32c3-builtin.cfg",
+        ));
+
+    let launch = fs::read_to_string(temp.path().join(".vscode").join("launch.json"))
+        .expect("launch should exist");
+    assert!(launch.contains("\"interface/ftdi/esp32_devkitj_v1.cfg\""));
+    assert!(launch.contains("\"board/esp32c3-builtin.cfg\""));
+}
+
+#[test]
+fn patch_rejects_openocd_configs_without_openocd_backend() {
+    let temp = tempdir().expect("temp dir should exist");
+    write_patchable_project(temp.path());
+
+    Command::cargo_bin("espwrap")
+        .expect("binary should build")
+        .args([
+            "patch",
+            temp.path().to_str().expect("path should be utf-8"),
+            "--chip",
+            "esp32c3",
+            "--openocd-config",
+            "board/custom.cfg",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "`--openocd-config` requires `--debug-backend openocd`",
+        ));
+}
+
+#[test]
+fn patch_none_backend_removes_managed_debug_entries() {
+    let temp = tempdir().expect("temp dir should exist");
+    write_patchable_project(temp.path());
+
+    Command::cargo_bin("espwrap")
+        .expect("binary should build")
+        .args([
+            "patch",
+            temp.path().to_str().expect("path should be utf-8"),
+            "--chip",
+            "esp32c3",
+        ])
+        .assert()
+        .success();
+
+    Command::cargo_bin("espwrap")
+        .expect("binary should build")
+        .args([
+            "patch",
+            temp.path().to_str().expect("path should be utf-8"),
+            "--chip",
+            "esp32c3",
+            "--debug-backend",
+            "none",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("debug backend: none"));
+
+    let launch = fs::read_to_string(temp.path().join(".vscode").join("launch.json"))
+        .expect("launch should exist");
+    assert!(!launch.contains("\"probe-rs-debug\""));
+    assert!(!launch.contains("\"cortex-debug\""));
+    assert!(!launch.contains("\"name\": \"espwrap: Flash + Debug\""));
+
+    let extensions = fs::read_to_string(temp.path().join(".vscode").join("extensions.json"))
+        .expect("extensions should exist");
+    assert!(!extensions.contains("\"probe-rs.probe-rs-debugger\""));
+    assert!(!extensions.contains("\"marus25.cortex-debug\""));
 }
 
 fn write_fake_generator_help(root: &Path) -> std::path::PathBuf {

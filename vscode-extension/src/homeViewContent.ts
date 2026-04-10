@@ -86,7 +86,7 @@ export function renderHomeDocument(args: {
         description: "Patch an existing workspace or run diagnostics when you need them.",
         body: `<div class="action-list">
           ${renderActionButton("espwrap.patchCurrentWorkspace", "Patch Current Workspace", "Open the patch form for the current workspace and preview the exact CLI call first.")}
-          ${renderActionButton("espwrap.doctor", "Run Doctor", "Check espwrap, esp-generate, probe-rs, and related tools, then show the structured report.")}
+          ${renderActionButton("espwrap.doctor", "Run Doctor", "Check espwrap, esp-generate, probe-rs, openocd, and related tools, then show the structured report.")}
         </div>`,
       })}
 

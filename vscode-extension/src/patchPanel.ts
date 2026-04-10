@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 
 import { resolveEspwrapBinary } from "./espwrapBinary";
-import { buildPatchCommand } from "./formModel";
+import { buildPatchCommand, parseOpenOcdConfigs } from "./formModel";
 import { renderPatchDocument, type PatchFormState } from "./patchPanelContent";
 import { runEspwrapCommand } from "./espwrapCli";
 
@@ -20,6 +20,8 @@ export async function openPatchPanel(
     projectPath: folders[0].uri.fsPath,
     chip: "",
     bin: "",
+    debugBackend: "probe-rs",
+    openocdConfigs: "",
     dryRun: false,
     backup: true,
   };
@@ -96,6 +98,8 @@ async function postPreview(webview: vscode.Webview, binaryPath: string, state: P
       projectPath: state.projectPath,
       chip: state.chip,
       bin: state.bin,
+      debugBackend: state.debugBackend,
+      openocdConfigs: parseOpenOcdConfigs(state.openocdConfigs),
       dryRun: state.dryRun,
       backup: state.backup,
     }).preview
@@ -119,6 +123,8 @@ async function patchWorkspace(binaryPath: string, output: vscode.OutputChannel, 
     projectPath: state.projectPath,
     chip: state.chip,
     bin: state.bin,
+    debugBackend: state.debugBackend,
+    openocdConfigs: parseOpenOcdConfigs(state.openocdConfigs),
     dryRun: state.dryRun,
     backup: state.backup,
   });
@@ -184,6 +190,9 @@ function normalizeState(value: unknown): PatchFormState | null {
     projectPath: stringValue(value.projectPath),
     chip: stringValue(value.chip),
     bin: stringValue(value.bin),
+    debugBackend:
+      value.debugBackend === "openocd" || value.debugBackend === "none" ? value.debugBackend : "probe-rs",
+    openocdConfigs: stringValue(value.openocdConfigs),
     dryRun: booleanValue(value.dryRun),
     backup: booleanValue(value.backup),
   };

@@ -8,13 +8,14 @@ const extensionDir = path.resolve(scriptDir, "..");
 const formModel = await import(pathToFileURL(path.join(extensionDir, "dist", "formModel.js")).href);
 const homeViewContent = await import(pathToFileURL(path.join(extensionDir, "dist", "homeViewContent.js")).href);
 const patchPanelContent = await import(pathToFileURL(path.join(extensionDir, "dist", "patchPanelContent.js")).href);
+const webviewJson = await import(pathToFileURL(path.join(extensionDir, "dist", "webviewJson.js")).href);
 
 run("applies the embassy preset", () => {
   const state = formModel.createDefaultState("esp32c3", false, "D:/work");
   const next = formModel.applyPreset(state, "embassy");
 
   assert.equal(next.embassy, true);
-  assert.equal(next.probeRs, true);
+  assert.equal(next.debugBackend, "probe-rs");
   assert.equal(next.log, true);
   assert.equal(next.espBacktrace, true);
 });
@@ -38,6 +39,8 @@ run("builds a new project command with selected options", () => {
     "--install-missing",
     "--name",
     "demo",
+    "--debug-backend",
+    "probe-rs",
     "--bin",
     "app",
     "--",
@@ -58,8 +61,6 @@ run("builds a new project command with selected options", () => {
     "log",
     "-o",
     "esp-backtrace",
-    "-o",
-    "probe-rs",
     "--toolchain",
     "nightly",
   ]);
@@ -71,6 +72,8 @@ run("builds a patch command with optional flags", () => {
     projectPath: "D:/esp/demo",
     chip: "esp32c3",
     bin: "firmware",
+    debugBackend: "openocd",
+    openocdConfigs: ["board/esp32c3-builtin.cfg", "interface/ftdi/esp32_devkitj_v1.cfg"],
     backup: true,
     dryRun: true,
   });
@@ -82,8 +85,47 @@ run("builds a patch command with optional flags", () => {
     "esp32c3",
     "--bin",
     "firmware",
+    "--debug-backend",
+    "openocd",
+    "--openocd-config",
+    "board/esp32c3-builtin.cfg",
+    "--openocd-config",
+    "interface/ftdi/esp32_devkitj_v1.cfg",
     "--dry-run",
     "--backup",
+  ]);
+});
+
+run("builds a new project command with custom openocd config files", () => {
+  const state = {
+    ...formModel.createDefaultState("esp32c3", false, "D:/esp"),
+    name: "demo",
+    debugBackend: "openocd",
+    openocdConfigs: "board/esp32c3-builtin.cfg\ninterface/ftdi/esp32_devkitj_v1.cfg",
+  };
+
+  const built = formModel.buildNewProjectCommand("espwrap", state);
+
+  assert.deepEqual(built.args, [
+    "new",
+    "--name",
+    "demo",
+    "--debug-backend",
+    "openocd",
+    "--openocd-config",
+    "board/esp32c3-builtin.cfg",
+    "--openocd-config",
+    "interface/ftdi/esp32_devkitj_v1.cfg",
+    "--",
+    "--headless",
+    "--chip",
+    "esp32c3",
+    "--output-path",
+    path.normalize("D:/esp"),
+    "-o",
+    "log",
+    "-o",
+    "esp-backtrace",
   ]);
 });
 
@@ -97,17 +139,25 @@ run("parses quoted extra args", () => {
   ]);
 });
 
+run("parses one openocd config file per non-empty line", () => {
+  assert.deepEqual(
+    formModel.parseOpenOcdConfigs(" board/esp32c3-builtin.cfg \n\n interface/ftdi/esp32_devkitj_v1.cfg \r\n"),
+    ["board/esp32c3-builtin.cfg", "interface/ftdi/esp32_devkitj_v1.cfg"]
+  );
+});
+
 run("rejects conflicting extra args that duplicate form-managed fields", () => {
   const state = {
     ...formModel.createDefaultState("esp32c3", false, "D:/esp"),
     name: "demo",
-    extraEspwrapArgs: "--name other --install-missing",
+    extraEspwrapArgs: "--name other --install-missing --debug-backend openocd",
     extraGenerateArgs: "--chip esp32s3 --output-path elsewhere",
   };
 
   assert.deepEqual(formModel.validateNewProjectState(state), [
     "Extra espwrap args cannot include `--name`. Project Name is already controlled by the form.",
     "Extra espwrap args cannot include `--install-missing`. Install Missing Tools is already controlled by the checkbox.",
+    "Extra espwrap args cannot include `--debug-backend`. Debug Backend is already controlled by the form.",
     "Extra esp-generate args cannot include `--chip`. Chip is already selected above.",
     "Extra esp-generate args cannot include `--output-path`. Output Directory is already selected above.",
   ]);
@@ -127,6 +177,16 @@ run("resolves relative output paths against the provided base directory", () => 
   assert.equal(built.projectDir, path.resolve("D:/workspace", "generated", "demo"));
 });
 
+run("serializes webview payloads into parseable JSON", () => {
+  const text = webviewJson.serializeWebviewPayload({
+    tricky: "</script><div>&\"'",
+  });
+  assert.deepEqual(JSON.parse(text), {
+    tricky: "</script><div>&\"'",
+  });
+  assert.ok(!text.includes("</script>"));
+});
+
 run("renders detailed CLI badges on the home page", () => {
   const html = homeViewContent.renderHomeDocument({
     scriptUri: "home.js",
@@ -138,7 +198,7 @@ run("renders detailed CLI badges on the home page", () => {
       configuredPath: "",
       resolvedBinary: {
         sourceLabel: "Bundled CLI",
-        version: "espwrap 0.2.0",
+        version: "espwrap 0.2.1",
         binaryPath: "D:/espwrap/bin/espwrap.exe",
         supportsDoctorJson: true,
         supportsInstallMissing: true,
@@ -206,6 +266,8 @@ run("renders the patch workspace form controls", () => {
       projectPath: "D:/esp/demo",
       chip: "esp32s3",
       bin: "firmware",
+      debugBackend: "openocd",
+      openocdConfigs: "board/esp32s3-builtin.cfg",
       dryRun: true,
       backup: true,
     },
@@ -221,6 +283,9 @@ run("renders the patch workspace form controls", () => {
   assert.match(html, /Workspace Folder/);
   assert.match(html, /Chip Override/);
   assert.match(html, /Binary Override/);
+  assert.match(html, /Debug Backend/);
+  assert.match(html, /OpenOCD \+ GDB/);
+  assert.match(html, /OpenOCD Config Files/);
   assert.match(html, /Run Patch/);
   assert.match(html, /data-toggle="dryRun"/);
   assert.match(html, /data-toggle="backup"/);

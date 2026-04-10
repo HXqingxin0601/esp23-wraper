@@ -145,18 +145,28 @@ pre {
 
 .path-row,
 .actions,
-.split,
 .toggle-top {
   display: flex;
   gap: 12px;
 }
 
 .split {
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  align-items: start;
 }
 
 .split > .field {
-  flex: 1 1 240px;
+  margin-bottom: 0;
+}
+
+.basics-split + .field {
+  margin-top: 16px;
+}
+
+.ble-stack-field {
+  margin-top: 18px;
 }
 
 input[type="text"],
@@ -299,6 +309,12 @@ button.secondary {
 
 @media (max-width: 900px) {
   .hero {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .split {
     grid-template-columns: 1fr;
   }
 }

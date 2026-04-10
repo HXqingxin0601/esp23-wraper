@@ -2,7 +2,7 @@
 
 `espwrap` is a host-side CLI that wraps `esp-generate` for official `no_std`
 ESP Rust templates and patches project-local VS Code debug configuration for
-`probe-rs`.
+selectable backends such as `probe-rs` and `OpenOCD + GDB`.
 
 It only edits files in the target project, never VS Code user/global settings.
 
@@ -22,7 +22,7 @@ It only edits files in the target project, never VS Code user/global settings.
   - chip
   - target triple
   - binary path
-  - `probe-rs` launch/attach entries
+  - backend-specific launch/attach entries for `probe-rs`, `OpenOCD + GDB`, or no managed debug config
 - Keep existing JSON files and merge updates instead of replacing blindly.
 - Provide diagnostics via `espwrap doctor`.
 - Offer guided installation for supported missing Cargo-installed tools.
@@ -137,7 +137,8 @@ Useful local packaging commands:
 
 - Rust toolchain (`cargo`, `rustc`)
 - `esp-generate`
-- For VS Code debugging: `probe-rs` tools and VS Code `probe-rs` extension
+- For VS Code debugging with `--debug-backend probe-rs`: `probe-rs` tools and VS Code `probe-rs` extension
+- For VS Code debugging with `--debug-backend openocd`: `openocd`, a matching Espressif GDB on `PATH`, and the VS Code `cortex-debug` extension
 
 Install `esp-generate` if needed:
 
@@ -154,7 +155,19 @@ cargo install probe-rs-tools --locked
 You can also use other install methods from the official docs:
 https://probe.rs/docs/getting-started/installation/
 
-Install the VS Code extension (required for VS Code debug sessions):
+For `OpenOCD + GDB` workflows, install the VS Code extension:
+
+```powershell
+code --install-extension marus25.cortex-debug
+```
+
+If you select the `openocd` backend, make sure `openocd` plus the matching
+Espressif GDB are on `PATH` for your chip, for example
+`riscv32-esp-elf-gdb` or `xtensa-esp32s3-elf-gdb`.
+The generated OpenOCD config uses sensible defaults, but some boards may still
+need you to adjust the `configFiles` in `.vscode/launch.json`.
+
+Install the `probe-rs` VS Code extension when you use the default backend:
 
 ```powershell
 code --install-extension probe-rs.probe-rs-debugger
@@ -213,7 +226,8 @@ Notes:
 
 - `espwrap` forwards extra args after `--` directly to `esp-generate`.
 - `--option vscode` is auto-added unless `--no-vscode-option` is used.
-- `--option probe-rs` is opt-in via `--add-probe-rs-option`.
+- `--debug-backend <probe-rs|openocd|none>` selects the VS Code debug template that `espwrap` patches in.
+- `--debug-backend probe-rs` also auto-adds `--option probe-rs` for `esp-generate` unless you already passed it yourself.
 - `--install-missing` auto-installs supported missing tools such as `esp-generate`.
 - `espwrap new --help` prints both `espwrap`'s own flags and the current `esp-generate --help` output.
 
@@ -227,8 +241,20 @@ Useful flags:
 
 - `--dry-run`: preview changes without writing files.
 - `--backup`: create `*.bak` backups before overwriting.
+- `--debug-backend <probe-rs|openocd|none>`: choose which debug workflow `espwrap` manages in `.vscode`.
+- `--openocd-config <FILE>`: repeat when `--debug-backend openocd` to override the generated `configFiles` list.
 - `--chip <chip>`: force chip if auto-detect is ambiguous.
 - `--bin <name>`: force binary name in multi-bin projects.
+
+When you use `--debug-backend openocd`, `espwrap` picks a board or target config
+automatically from the chip. Use `--openocd-config` once per file when your
+probe or board needs a custom interface/board combination, for example:
+
+```powershell
+espwrap patch d:\path\to\project --debug-backend openocd `
+  --openocd-config interface/ftdi/esp32_devkitj_v1.cfg `
+  --openocd-config board/esp32s3-builtin.cfg
+```
 
 ### 4) Diagnose environment
 
@@ -239,7 +265,8 @@ espwrap doctor --json
 espwrap doctor --strict
 ```
 
-`doctor` checks required and optional tools, probe visibility, and Cargo bin PATH.
+`doctor` checks required and optional tools, probe visibility, ESP GDB presence,
+and Cargo bin PATH.
 Use `--fix` to install supported missing Cargo-based tools such as `esp-generate`,
 `probe-rs-tools`, `espflash`, and `esp-config`.
 Use `--json` when you want machine-readable output for scripts, CI, or editor integrations.

@@ -1,7 +1,11 @@
+import { serializeWebviewPayload } from "./webviewJson";
+
 export interface PatchFormState {
   projectPath: string;
   chip: string;
   bin: string;
+  debugBackend: "probe-rs" | "openocd" | "none";
+  openocdConfigs: string;
   dryRun: boolean;
   backup: boolean;
 }
@@ -73,6 +77,20 @@ export function renderPatchDocument(args: {
 
         <section class="card">
           <h2>Patch Options</h2>
+          <div class="field">
+            <label for="debugBackend">Debug Backend</label>
+            <p>Choose which managed VS Code debug configuration espwrap should write for this workspace.</p>
+            <select id="debugBackend">
+              ${renderOption("probe-rs", "probe-rs", args.state.debugBackend === "probe-rs")}
+              ${renderOption("openocd", "OpenOCD + GDB", args.state.debugBackend === "openocd")}
+              ${renderOption("none", "None", args.state.debugBackend === "none")}
+            </select>
+          </div>
+          <div class="field">
+            <label for="openocdConfigs">OpenOCD Config Files</label>
+            <p>Optional when using <code>OpenOCD + GDB</code>. Enter one config file per line to override the generated defaults.</p>
+            <textarea id="openocdConfigs" rows="3">${escapeHtml(args.state.openocdConfigs)}</textarea>
+          </div>
           <div class="option-grid">
             ${renderCheckbox("backup", "Create backups", "Write .bak files before overwriting project-local VS Code files.", args.state.backup)}
             ${renderCheckbox("dryRun", "Dry run", "Preview the patch without writing any files.", args.state.dryRun)}
@@ -92,10 +110,10 @@ export function renderPatchDocument(args: {
       </main>
     </div>
 
-    <script id="espwrap-patch-data" type="application/json">${escapeHtml(JSON.stringify({
+    <script id="espwrap-patch-data" type="application/json">${serializeWebviewPayload({
       initialState: args.state,
       workspaces: args.workspaces,
-    }))}</script>
+    })}</script>
     <script nonce="${args.nonce}" src="${args.scriptUri}"></script>
   </body>
 </html>`;

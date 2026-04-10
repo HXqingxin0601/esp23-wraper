@@ -7,6 +7,8 @@
     projectPath: document.getElementById("projectPath"),
     chip: document.getElementById("chip"),
     bin: document.getElementById("bin"),
+    debugBackend: document.getElementById("debugBackend"),
+    openocdConfigs: document.getElementById("openocdConfigs"),
     copyCommand: document.getElementById("copyCommand"),
     submitButton: document.getElementById("submitButton"),
     commandPreview: document.getElementById("commandPreview"),
@@ -22,9 +24,19 @@
       projectPath: controls.projectPath.value,
       chip: controls.chip.value,
       bin: controls.bin.value,
+      debugBackend: controls.debugBackend.value,
+      openocdConfigs: controls.openocdConfigs.value,
       dryRun: Boolean(getToggle("dryRun")?.checked),
       backup: Boolean(getToggle("backup")?.checked),
     };
+  }
+
+  function syncBackendFields() {
+    const isOpenOcd = controls.debugBackend.value === "openocd";
+    controls.openocdConfigs.disabled = !isOpenOcd;
+    controls.openocdConfigs.placeholder = isOpenOcd
+      ? "board/esp32c3-builtin.cfg\ninterface/ftdi/esp32_devkitj_v1.cfg"
+      : "Switch Debug Backend to OpenOCD + GDB to use custom config files.";
   }
 
   function setSubmitting(busy) {
@@ -42,6 +54,20 @@
 
     controls.errors.hidden = false;
     controls.errors.innerHTML = errors.map((error) => `<div>${escapeHtml(error)}</div>`).join("");
+  }
+
+  function setPreviewText(preview, errors) {
+    if (preview) {
+      controls.commandPreview.textContent = preview;
+      return;
+    }
+
+    if (errors && errors.length > 0) {
+      controls.commandPreview.textContent = "# Fix the validation errors above to render the full command preview.";
+      return;
+    }
+
+    controls.commandPreview.textContent = "# Preview will appear here.";
   }
 
   function requestPreview() {
@@ -83,9 +109,19 @@
     });
   });
 
-  document.querySelectorAll("input, select").forEach((element) => {
-    element.addEventListener("input", requestPreview);
-    element.addEventListener("change", requestPreview);
+  document.querySelectorAll("input, select, textarea").forEach((element) => {
+    element.addEventListener("input", () => {
+      if (element === controls.debugBackend) {
+        syncBackendFields();
+      }
+      requestPreview();
+    });
+    element.addEventListener("change", () => {
+      if (element === controls.debugBackend) {
+        syncBackendFields();
+      }
+      requestPreview();
+    });
   });
 
   window.addEventListener("message", (event) => {
@@ -95,8 +131,9 @@
     }
 
     if (message.type === "preview") {
-      controls.commandPreview.textContent = message.preview || "";
-      setErrors(Array.isArray(message.errors) ? message.errors : []);
+      const errors = Array.isArray(message.errors) ? message.errors : [];
+      setPreviewText(message.preview || "", errors);
+      setErrors(errors);
       return;
     }
 
@@ -107,8 +144,11 @@
 
   if (payload?.initialState) {
     controls.projectPath.value = payload.initialState.projectPath || controls.projectPath.value;
+    controls.debugBackend.value = payload.initialState.debugBackend || controls.debugBackend.value;
+    controls.openocdConfigs.value = payload.initialState.openocdConfigs || controls.openocdConfigs.value;
   }
 
+  syncBackendFields();
   setSubmitting(false);
   requestPreview();
 })();

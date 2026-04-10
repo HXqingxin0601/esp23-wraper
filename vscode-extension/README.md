@@ -14,6 +14,8 @@ development inside this repository. It is not being published yet.
 - Patch the current workspace from a guided form instead of a stack of input boxes
 - Run `espwrap doctor` and show structured diagnostics
 - Preview the exact CLI command before execution
+- Choose the managed debug backend from the form (`probe-rs`, `OpenOCD + GDB`, or `none`)
+- Enter custom OpenOCD config files line by line when a board needs overrides beyond the generated defaults
 - Auto-detect a bundled CLI, local repo build, or PATH entry before asking you to configure `espwrap.binaryPath`
 
 ## Requirements
@@ -22,7 +24,8 @@ development inside this repository. It is not being published yet.
   For local repo testing, `cargo build` is enough. You do not need to
   globally install `espwrap` first.
 - `esp-generate` installed for `no_std` project generation
-- `probe-rs` tools installed if you plan to flash/debug from VS Code
+- `probe-rs` tools installed if you plan to use the `probe-rs` backend
+- `openocd` plus a matching Espressif GDB on `PATH` if you plan to use the `OpenOCD + GDB` backend
 
 If you want the official `std` / ESP-IDF template, generate that separately
 with `cargo generate esp-rs/esp-idf-template cargo`. The current `ESP Wrap`

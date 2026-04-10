@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{ArgAction, CommandFactory, Parser, Subcommand};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -26,7 +26,7 @@ const RUSTUP_INSTALL_URL: &str = "https://rustup.rs/";
 #[command(
     author,
     version,
-    about = "Wrap esp-generate and patch project-local VS Code config for probe-rs."
+    about = "Wrap esp-generate and patch project-local VS Code debug config."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -49,9 +49,12 @@ enum Commands {
         /// Do not auto-add `--option vscode`.
         #[arg(long, action = ArgAction::SetTrue)]
         no_vscode_option: bool,
-        /// Also add `--option probe-rs` before invoking esp-generate.
-        #[arg(long, action = ArgAction::SetTrue)]
-        add_probe_rs_option: bool,
+        /// Select which VS Code debug workflow to generate.
+        #[arg(long, value_enum, default_value_t = DebugBackend::ProbeRs)]
+        debug_backend: DebugBackend,
+        /// Override the generated OpenOCD config files. Repeat for multiple entries.
+        #[arg(long = "openocd-config", value_name = "FILE", action = ArgAction::Append)]
+        openocd_config: Vec<String>,
         /// Skip the post-generation patching step.
         #[arg(long, action = ArgAction::SetTrue)]
         no_patch: bool,
@@ -79,6 +82,12 @@ enum Commands {
         /// Override auto-detected binary name.
         #[arg(long)]
         bin: Option<String>,
+        /// Select which VS Code debug workflow to generate.
+        #[arg(long, value_enum, default_value_t = DebugBackend::ProbeRs)]
+        debug_backend: DebugBackend,
+        /// Override the generated OpenOCD config files. Repeat for multiple entries.
+        #[arg(long = "openocd-config", value_name = "FILE", action = ArgAction::Append)]
+        openocd_config: Vec<String>,
         /// Preview .vscode changes without writing files.
         #[arg(long, action = ArgAction::SetTrue)]
         dry_run: bool,
@@ -136,10 +145,33 @@ struct ProjectInfo {
     binary_format: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum DebugBackend {
+    #[default]
+    #[value(name = "probe-rs")]
+    ProbeRs,
+    #[value(name = "openocd")]
+    OpenOcd,
+    #[value(name = "none")]
+    None,
+}
+
+impl DebugBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            DebugBackend::ProbeRs => "probe-rs",
+            DebugBackend::OpenOcd => "openocd",
+            DebugBackend::None => "none",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct PatchOptions {
     dry_run: bool,
     backup: bool,
+    debug_backend: DebugBackend,
+    openocd_config_files: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -149,7 +181,6 @@ struct NewCommandOptions {
     name_override: Option<String>,
     esp_generate_args: Vec<String>,
     add_vscode_option: bool,
-    add_probe_rs_option: bool,
     patch_after_generate: bool,
     bin_override: Option<String>,
     patch_options: PatchOptions,
@@ -269,6 +300,16 @@ fn probe_rs_tool() -> DoctorTool {
     }
 }
 
+fn openocd_tool() -> DoctorTool {
+    DoctorTool {
+        name: "openocd",
+        command: "openocd",
+        args: &["--version"],
+        install_package: None,
+        install_hint: "",
+    }
+}
+
 fn espflash_tool() -> DoctorTool {
     DoctorTool {
         name: "espflash",
@@ -301,7 +342,8 @@ fn main() -> Result<()> {
             install_missing,
             name,
             no_vscode_option,
-            add_probe_rs_option,
+            debug_backend,
+            openocd_config,
             no_patch,
             dry_run,
             backup,
@@ -313,21 +355,37 @@ fn main() -> Result<()> {
             name_override: name,
             esp_generate_args,
             add_vscode_option: !no_vscode_option,
-            add_probe_rs_option,
             patch_after_generate: !no_patch,
             bin_override: bin,
-            patch_options: PatchOptions { dry_run, backup },
+            patch_options: PatchOptions {
+                dry_run,
+                backup,
+                debug_backend,
+                openocd_config_files: openocd_config,
+            },
         }),
         Commands::Patch {
             project,
             chip,
             bin,
+            debug_backend,
+            openocd_config,
             dry_run,
             backup,
         } => {
             preflight_patch()?;
             let project = canonicalize_lossy(&project)?;
-            patch_existing_project(&project, chip, bin, PatchOptions { dry_run, backup })
+            patch_existing_project(
+                &project,
+                chip,
+                bin,
+                PatchOptions {
+                    dry_run,
+                    backup,
+                    debug_backend,
+                    openocd_config_files: openocd_config,
+                },
+            )
         }
         Commands::Doctor {
             strict,
@@ -443,7 +501,6 @@ fn print_upstream_help(esp_generate_bin: Option<&str>) -> Result<()> {
 fn preflight_new(
     esp_generate_bin: &str,
     patch_after_generate: bool,
-    expect_probe_rs_workflow: bool,
     install_missing: bool,
 ) -> Result<()> {
     ensure_esp_generate_available(
@@ -453,15 +510,11 @@ fn preflight_new(
     if patch_after_generate {
         ensure_tool_available(cargo_tool(), InstallDisposition::Never)?;
     }
-    if expect_probe_rs_workflow {
-        warn_if_probe_rs_missing();
-    }
     Ok(())
 }
 
 fn preflight_patch() -> Result<()> {
     ensure_tool_available(cargo_tool(), InstallDisposition::Never)?;
-    warn_if_probe_rs_missing();
     Ok(())
 }
 
@@ -584,17 +637,42 @@ fn install_cargo_package(package: &str, tool_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn warn_if_probe_rs_missing() {
-    match probe_command(probe_rs_tool().command, probe_rs_tool().args) {
+fn warn_if_backend_tools_missing(info: &ProjectInfo, debug_backend: DebugBackend) {
+    match debug_backend {
+        DebugBackend::ProbeRs => warn_if_command_missing(
+            probe_rs_tool().command,
+            probe_rs_tool().args,
+            format!(
+                "warning: `probe-rs` is not installed. VS Code debug configs will be created, but flash/debug actions will not work until you install it with `{}`.",
+                cargo_install_command("probe-rs-tools")
+            ),
+        ),
+        DebugBackend::OpenOcd => {
+            warn_if_command_missing(
+                openocd_tool().command,
+                openocd_tool().args,
+                "warning: `openocd` is not installed. VS Code OpenOCD configs will be created, but debug sessions will not work until `openocd` is available on PATH.".to_owned(),
+            );
+            let gdb_command = gdb_command_for_chip(&info.chip);
+            warn_if_command_missing(
+                gdb_command,
+                &["--version"],
+                format!(
+                    "warning: `{gdb_command}` is not installed. VS Code OpenOCD configs will be created, but debug sessions will not work until the matching Espressif GDB is available on PATH."
+                ),
+            );
+        }
+        DebugBackend::None => {}
+    }
+}
+
+fn warn_if_command_missing(command: &str, args: &[&str], missing_message: String) {
+    match probe_command(command, args) {
         ToolProbe::Available(_) => {}
-        ToolProbe::Missing => eprintln!(
-            "warning: `probe-rs` is not installed. VS Code debug configs will be created, but flash/debug actions will not work until you install it with `{}`.",
-            cargo_install_command("probe-rs-tools")
-        ),
-        ToolProbe::Error(detail) => eprintln!(
-            "warning: `probe-rs` is installed but could not be verified: {}",
-            detail
-        ),
+        ToolProbe::Missing => eprintln!("{missing_message}"),
+        ToolProbe::Error(detail) => {
+            eprintln!("warning: `{command}` is installed but could not be verified: {detail}")
+        }
     }
 }
 
@@ -670,31 +748,19 @@ fn cmd_new(options: NewCommandOptions) -> Result<()> {
         name_override,
         mut esp_generate_args,
         add_vscode_option,
-        add_probe_rs_option,
         patch_after_generate,
         bin_override,
         patch_options,
     } = options;
+    let debug_backend = patch_options.debug_backend;
+    validate_patch_options(&patch_options, patch_after_generate)?;
 
     apply_name_override(&mut esp_generate_args, name_override.as_deref())?;
-
-    if add_vscode_option && !has_option(&esp_generate_args, "vscode") {
-        esp_generate_args.push("--option".to_owned());
-        esp_generate_args.push("vscode".to_owned());
-    }
-    if add_probe_rs_option && !has_option(&esp_generate_args, "probe-rs") {
-        esp_generate_args.push("--option".to_owned());
-        esp_generate_args.push("probe-rs".to_owned());
-    }
+    apply_generate_options(&mut esp_generate_args, add_vscode_option, debug_backend);
 
     let mut generate_context = infer_generate_context(&esp_generate_args)?;
     generate_context.project_name = name_override.clone();
-    preflight_new(
-        &esp_generate_bin,
-        patch_after_generate,
-        patch_after_generate || add_probe_rs_option,
-        install_missing,
-    )?;
+    preflight_new(&esp_generate_bin, patch_after_generate, install_missing)?;
     fs::create_dir_all(&generate_context.output_dir).with_context(|| {
         format!(
             "failed to create esp-generate output directory {}",
@@ -743,7 +809,12 @@ fn cmd_new(options: NewCommandOptions) -> Result<()> {
 
 fn cmd_doctor(strict: bool, fix: bool, json_output: bool) -> Result<()> {
     let required_tools = [rustc_tool(), cargo_tool(), esp_generate_tool()];
-    let optional_tools = [probe_rs_tool(), espflash_tool(), esp_config_tool()];
+    let optional_tools = [
+        probe_rs_tool(),
+        openocd_tool(),
+        espflash_tool(),
+        esp_config_tool(),
+    ];
     let install_disposition = default_fix_disposition(fix);
 
     if !json_output {
@@ -774,6 +845,13 @@ fn cmd_doctor(strict: bool, fix: bool, json_output: bool) -> Result<()> {
         name: "probe-scan".to_owned(),
         status: probe_status,
         detail: probe_detail,
+        required: false,
+    });
+    let (gdb_status, gdb_detail) = check_any_esp_gdb();
+    reports.push(DoctorCheckReport {
+        name: "esp-gdb".to_owned(),
+        status: gdb_status,
+        detail: gdb_detail,
         required: false,
     });
     let (path_status, path_detail) = check_cargo_bin_on_path();
@@ -849,14 +927,21 @@ fn patch_existing_project(
     bin_override: Option<String>,
     patch_options: PatchOptions,
 ) -> Result<()> {
+    validate_patch_options(&patch_options, true)?;
     let info = inspect_project(project_root, chip_override, bin_override)?;
-    let report = patch_vscode_dir(&info, patch_options)?;
+    warn_if_backend_tools_missing(&info, patch_options.debug_backend);
+    let report = patch_vscode_dir(&info, patch_options.clone())?;
 
     println!("project: {}", info.package_name);
     println!("path: {}", info.root.display());
     println!("chip: {}", info.chip);
     println!("target: {}", info.target_triple);
     println!("bin: {}", info.bin_name);
+    println!("debug backend: {}", patch_options.debug_backend.as_str());
+    if patch_options.debug_backend == DebugBackend::OpenOcd {
+        let configs = resolved_openocd_config_files(&info.chip, &patch_options);
+        println!("openocd configs: {}", configs.join(", "));
+    }
     println!(
         "{} files changed, {} unchanged",
         report.changed_files.len(),
@@ -1013,6 +1098,33 @@ fn has_dependency(package: &MetadataPackage, dependency_name: &str) -> bool {
         .any(|dependency| dependency.name == dependency_name)
 }
 
+fn gdb_command_for_chip(chip: &str) -> &'static str {
+    match chip {
+        "esp32" => "xtensa-esp32-elf-gdb",
+        "esp32s2" => "xtensa-esp32s2-elf-gdb",
+        "esp32s3" => "xtensa-esp32s3-elf-gdb",
+        _ => "riscv32-esp-elf-gdb",
+    }
+}
+
+fn default_openocd_config_files(chip: &str) -> Vec<String> {
+    match chip {
+        "esp32c3" => vec!["board/esp32c3-builtin.cfg".to_owned()],
+        "esp32c6" => vec!["board/esp32c6-builtin.cfg".to_owned()],
+        "esp32h2" => vec!["board/esp32h2-builtin.cfg".to_owned()],
+        "esp32s3" => vec!["board/esp32s3-builtin.cfg".to_owned()],
+        _ => vec![format!("target/{chip}.cfg")],
+    }
+}
+
+fn resolved_openocd_config_files(chip: &str, options: &PatchOptions) -> Vec<String> {
+    if options.openocd_config_files.is_empty() {
+        default_openocd_config_files(chip)
+    } else {
+        options.openocd_config_files.clone()
+    }
+}
+
 fn patch_vscode_dir(info: &ProjectInfo, options: PatchOptions) -> Result<PatchReport> {
     let vscode_dir = info.root.join(".vscode");
     fs::create_dir_all(&vscode_dir)
@@ -1023,21 +1135,21 @@ fn patch_vscode_dir(info: &ProjectInfo, options: PatchOptions) -> Result<PatchRe
     record_patch_result(
         &mut report,
         settings_path.clone(),
-        patch_settings_json(&settings_path, info, options)?,
+        patch_settings_json(&settings_path, info, options.clone())?,
     );
 
     let tasks_path = vscode_dir.join("tasks.json");
     record_patch_result(
         &mut report,
         tasks_path.clone(),
-        patch_tasks_json(&tasks_path, options)?,
+        patch_tasks_json(&tasks_path, options.clone())?,
     );
 
     let launch_path = vscode_dir.join("launch.json");
     record_patch_result(
         &mut report,
         launch_path.clone(),
-        patch_launch_json(&launch_path, info, options)?,
+        patch_launch_json(&launch_path, info, options.clone())?,
     );
 
     let extensions_path = vscode_dir.join("extensions.json");
@@ -1117,35 +1229,70 @@ fn patch_launch_json(
         .ok_or_else(|| anyhow!("`configurations` in {} is not an array", path.display()))?;
 
     let program_binary = format!("target/{}/debug/{}", info.target_triple, info.bin_name);
-    let launch_config = json!({
-        "type": "probe-rs-debug",
-        "request": "launch",
-        "name": FLASH_DEBUG_CONFIG_NAME,
-        "cwd": "${workspaceFolder}",
-        "preLaunchTask": BUILD_TASK_LABEL,
-        "chip": info.chip,
-        "flashingConfig": {
-            "flashingEnabled": true,
-            "haltAfterReset": true,
-            "formatOptions": { "binaryFormat": info.binary_format }
-        },
-        "coreConfigs": [{ "coreIndex": 0, "programBinary": program_binary, "rttEnabled": true }]
-    });
-    let attach_config = json!({
-        "type": "probe-rs-debug",
-        "request": "attach",
-        "name": ATTACH_CONFIG_NAME,
-        "cwd": "${workspaceFolder}",
-        "preLaunchTask": BUILD_TASK_LABEL,
-        "chip": info.chip,
-        "coreConfigs": [{
-            "coreIndex": 0,
-            "programBinary": format!("target/{}/debug/{}", info.target_triple, info.bin_name),
-            "rttEnabled": true
-        }]
-    });
-    upsert_launch_like(configs, "launch", launch_config);
-    upsert_launch_like(configs, "attach", attach_config);
+    let generated_configs = match options.debug_backend {
+        DebugBackend::ProbeRs => {
+            let launch_config = json!({
+                "type": "probe-rs-debug",
+                "request": "launch",
+                "name": FLASH_DEBUG_CONFIG_NAME,
+                "cwd": "${workspaceFolder}",
+                "preLaunchTask": BUILD_TASK_LABEL,
+                "chip": info.chip,
+                "flashingConfig": {
+                    "flashingEnabled": true,
+                    "haltAfterReset": true,
+                    "formatOptions": { "binaryFormat": info.binary_format }
+                },
+                "coreConfigs": [{ "coreIndex": 0, "programBinary": program_binary, "rttEnabled": true }]
+            });
+            let attach_config = json!({
+                "type": "probe-rs-debug",
+                "request": "attach",
+                "name": ATTACH_CONFIG_NAME,
+                "cwd": "${workspaceFolder}",
+                "preLaunchTask": BUILD_TASK_LABEL,
+                "chip": info.chip,
+                "coreConfigs": [{
+                    "coreIndex": 0,
+                    "programBinary": format!("target/{}/debug/{}", info.target_triple, info.bin_name),
+                    "rttEnabled": true
+                }]
+            });
+            vec![launch_config, attach_config]
+        }
+        DebugBackend::OpenOcd => {
+            let config_files = resolved_openocd_config_files(&info.chip, &options);
+            let gdb_path = gdb_command_for_chip(&info.chip);
+            let launch_config = json!({
+                "type": "cortex-debug",
+                "request": "launch",
+                "name": FLASH_DEBUG_CONFIG_NAME,
+                "cwd": "${workspaceFolder}",
+                "preLaunchTask": BUILD_TASK_LABEL,
+                "servertype": "openocd",
+                "serverpath": "openocd",
+                "configFiles": config_files,
+                "gdbPath": gdb_path,
+                "executable": program_binary,
+                "runToEntryPoint": "main"
+            });
+            let attach_config = json!({
+                "type": "cortex-debug",
+                "request": "attach",
+                "name": ATTACH_CONFIG_NAME,
+                "cwd": "${workspaceFolder}",
+                "preLaunchTask": BUILD_TASK_LABEL,
+                "servertype": "openocd",
+                "serverpath": "openocd",
+                "configFiles": resolved_openocd_config_files(&info.chip, &options),
+                "gdbPath": gdb_path,
+                "executable": format!("target/{}/debug/{}", info.target_triple, info.bin_name)
+            });
+            vec![launch_config, attach_config]
+        }
+        DebugBackend::None => Vec::new(),
+    };
+    replace_managed_launch_configs(configs, generated_configs);
     write_json_update(path, &before, &Value::Object(root), options)
 }
 
@@ -1163,12 +1310,19 @@ fn patch_extensions_json(path: &Path, options: PatchOptions) -> Result<FilePatch
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
-    for extension in [
-        "rust-lang.rust-analyzer",
-        "tamasfe.even-better-toml",
-        "probe-rs.probe-rs-debugger",
-    ] {
+    for extension in ["rust-lang.rust-analyzer", "tamasfe.even-better-toml"] {
         current.insert(extension.to_owned());
+    }
+    current.remove("probe-rs.probe-rs-debugger");
+    current.remove("marus25.cortex-debug");
+    match options.debug_backend {
+        DebugBackend::ProbeRs => {
+            current.insert("probe-rs.probe-rs-debugger".to_owned());
+        }
+        DebugBackend::OpenOcd => {
+            current.insert("marus25.cortex-debug".to_owned());
+        }
+        DebugBackend::None => {}
     }
     *recommendations = current.into_iter().map(Value::String).collect();
     write_json_update(path, &before, &Value::Object(root), options)
@@ -1277,32 +1431,25 @@ fn upsert_named(array: &mut Vec<Value>, key: &str, name: &str, new_value: Value)
     }
 }
 
-fn upsert_launch_like(array: &mut Vec<Value>, request: &str, new_value: Value) {
-    let matching_name = new_value
-        .as_object()
-        .and_then(|object| object.get("name"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+fn replace_managed_launch_configs(array: &mut Vec<Value>, new_values: Vec<Value>) {
+    array.retain(|item| !is_managed_launch_config(item));
+    array.extend(new_values);
+}
 
-    if let Some(slot) = array.iter_mut().find(|item| {
-        let Some(object) = item.as_object() else {
-            return false;
-        };
-        let item_type = object.get("type").and_then(Value::as_str);
-        let item_request = object.get("request").and_then(Value::as_str);
-        let item_name = object.get("name").and_then(Value::as_str);
+fn is_managed_launch_config(item: &Value) -> bool {
+    let Some(object) = item.as_object() else {
+        return false;
+    };
+    let item_type = object.get("type").and_then(Value::as_str);
+    let item_request = object.get("request").and_then(Value::as_str);
+    let item_name = object.get("name").and_then(Value::as_str);
 
-        (item_type == Some("probe-rs-debug")
-            && item_request == Some(request)
-            && item_name == Some(matching_name))
-            || (item_type == Some("probe-rs-debug")
-                && item_request == Some(request)
-                && matches!(item_name, Some("Launch" | "Attach")))
-    }) {
-        *slot = new_value;
-    } else {
-        array.push(new_value);
-    }
+    matches!(item_type, Some("probe-rs-debug" | "cortex-debug"))
+        && matches!(item_request, Some("launch" | "attach"))
+        && matches!(
+            item_name,
+            Some(FLASH_DEBUG_CONFIG_NAME | ATTACH_CONFIG_NAME | "Launch" | "Attach")
+        )
 }
 
 fn has_option(args: &[String], wanted: &str) -> bool {
@@ -1328,6 +1475,34 @@ fn has_option(args: &[String], wanted: &str) -> bool {
         }
     }
     false
+}
+
+fn apply_generate_options(
+    args: &mut Vec<String>,
+    add_vscode_option: bool,
+    debug_backend: DebugBackend,
+) {
+    if add_vscode_option && !has_option(args, "vscode") {
+        push_generate_option(args, "vscode");
+    }
+    if matches!(debug_backend, DebugBackend::ProbeRs) && !has_option(args, "probe-rs") {
+        push_generate_option(args, "probe-rs");
+    }
+}
+
+fn push_generate_option(args: &mut Vec<String>, option: &str) {
+    args.push("--option".to_owned());
+    args.push(option.to_owned());
+}
+
+fn validate_patch_options(options: &PatchOptions, patch_after_generate: bool) -> Result<()> {
+    if !patch_after_generate && !options.openocd_config_files.is_empty() {
+        bail!("`--openocd-config` requires patching to be enabled");
+    }
+    if options.debug_backend != DebugBackend::OpenOcd && !options.openocd_config_files.is_empty() {
+        bail!("`--openocd-config` requires `--debug-backend openocd`");
+    }
+    Ok(())
 }
 
 fn apply_name_override(args: &mut Vec<String>, name_override: Option<&str>) -> Result<()> {
@@ -1602,6 +1777,37 @@ fn check_probe_scan() -> (DoctorStatus, String) {
     }
 }
 
+fn check_any_esp_gdb() -> (DoctorStatus, String) {
+    let mut first_error: Option<String> = None;
+    for command in [
+        "riscv32-esp-elf-gdb",
+        "xtensa-esp32-elf-gdb",
+        "xtensa-esp32s2-elf-gdb",
+        "xtensa-esp32s3-elf-gdb",
+    ] {
+        match probe_command(command, &["--version"]) {
+            ToolProbe::Available(detail) => {
+                return (DoctorStatus::Ok, format!("{command}: {detail}"));
+            }
+            ToolProbe::Error(detail) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("{command}: {detail}"));
+                }
+            }
+            ToolProbe::Missing => {}
+        }
+    }
+
+    if let Some(detail) = first_error {
+        (DoctorStatus::Warn, detail)
+    } else {
+        (
+            DoctorStatus::Warn,
+            "no supported Espressif GDB toolchain was found on PATH".to_owned(),
+        )
+    }
+}
+
 fn check_cargo_bin_on_path() -> (DoctorStatus, String) {
     let Some(cargo_bin) = detect_cargo_bin_dir() else {
         return (
@@ -1687,9 +1893,11 @@ fn normalize_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Commands, PatchOptions, apply_name_override, cargo_install_command, create_backup,
+        Cli, Commands, DebugBackend, PatchOptions, apply_generate_options, apply_name_override,
+        cargo_install_command, create_backup, default_openocd_config_files, gdb_command_for_chip,
         has_option, infer_generate_context, infer_generate_name_arg,
-        infer_generated_project_from_snapshot, rustc_tool, tool_missing_detail, write_json_update,
+        infer_generated_project_from_snapshot, resolved_openocd_config_files, rustc_tool,
+        tool_missing_detail, validate_patch_options, write_json_update,
     };
     use clap::Parser;
     use serde_json::{Map, Value};
@@ -1712,6 +1920,46 @@ mod tests {
             } => {
                 assert!(install_missing);
                 assert_eq!(name.as_deref(), Some("demo"));
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_patch_openocd_backend_flag() {
+        let cli = Cli::try_parse_from(["espwrap", "patch", ".", "--debug-backend", "openocd"])
+            .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Patch { debug_backend, .. } => {
+                assert_eq!(debug_backend, DebugBackend::OpenOcd);
+            }
+            other => panic!("unexpected command parsed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_custom_openocd_configs() {
+        let cli = Cli::try_parse_from([
+            "espwrap",
+            "patch",
+            ".",
+            "--debug-backend",
+            "openocd",
+            "--openocd-config",
+            "board/custom.cfg",
+            "--openocd-config",
+            "interface/ftdi.cfg",
+        ])
+        .expect("cli parse should succeed");
+        match cli.command {
+            Commands::Patch { openocd_config, .. } => {
+                assert_eq!(
+                    openocd_config,
+                    vec![
+                        "board/custom.cfg".to_owned(),
+                        "interface/ftdi.cfg".to_owned()
+                    ]
+                );
             }
             other => panic!("unexpected command parsed: {other:?}"),
         }
@@ -1781,6 +2029,66 @@ mod tests {
         assert!(has_option(&args, "vscode"));
         assert!(has_option(&args, "probe-rs"));
         assert!(!has_option(&args, "wifi"));
+    }
+
+    #[test]
+    fn applies_generate_defaults_for_probe_rs_backend() {
+        let mut args = vec!["--chip".to_owned(), "esp32c3".to_owned()];
+        apply_generate_options(&mut args, true, DebugBackend::ProbeRs);
+        assert!(has_option(&args, "vscode"));
+        assert!(has_option(&args, "probe-rs"));
+    }
+
+    #[test]
+    fn skips_probe_rs_generate_option_for_openocd_backend() {
+        let mut args = vec!["--chip".to_owned(), "esp32c3".to_owned()];
+        apply_generate_options(&mut args, true, DebugBackend::OpenOcd);
+        assert!(has_option(&args, "vscode"));
+        assert!(!has_option(&args, "probe-rs"));
+    }
+
+    #[test]
+    fn infers_openocd_defaults_from_chip() {
+        assert_eq!(gdb_command_for_chip("esp32s3"), "xtensa-esp32s3-elf-gdb");
+        assert_eq!(
+            default_openocd_config_files("esp32c3"),
+            vec!["board/esp32c3-builtin.cfg".to_owned()]
+        );
+        assert_eq!(
+            default_openocd_config_files("esp32"),
+            vec!["target/esp32.cfg".to_owned()]
+        );
+    }
+
+    #[test]
+    fn custom_openocd_configs_override_defaults() {
+        let options = PatchOptions {
+            dry_run: false,
+            backup: false,
+            debug_backend: DebugBackend::OpenOcd,
+            openocd_config_files: vec!["board/custom.cfg".to_owned()],
+        };
+        assert_eq!(
+            resolved_openocd_config_files("esp32c3", &options),
+            vec!["board/custom.cfg".to_owned()]
+        );
+    }
+
+    #[test]
+    fn rejects_openocd_configs_without_openocd_backend() {
+        let options = PatchOptions {
+            dry_run: false,
+            backup: false,
+            debug_backend: DebugBackend::ProbeRs,
+            openocd_config_files: vec!["board/custom.cfg".to_owned()],
+        };
+        let error =
+            validate_patch_options(&options, true).expect_err("validation should reject mismatch");
+        assert!(
+            error
+                .to_string()
+                .contains("`--openocd-config` requires `--debug-backend openocd`")
+        );
     }
 
     #[test]
@@ -1936,6 +2244,8 @@ mod tests {
             PatchOptions {
                 dry_run: true,
                 backup: true,
+                debug_backend: DebugBackend::ProbeRs,
+                openocd_config_files: Vec::new(),
             },
         )
         .expect("dry-run write should succeed");

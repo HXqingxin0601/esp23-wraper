@@ -2,7 +2,7 @@
   "name": "espwrap-vscode",
   "displayName": "ESP Wrap",
   "description": "VS Code companion for espwrap, focused on Rust on ESP project generation, patching, and diagnostics.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "publisher": "hxqingxin12138",
   "license": "MIT",

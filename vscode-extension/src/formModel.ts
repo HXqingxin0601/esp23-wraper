@@ -27,12 +27,17 @@ export const BLE_OPTIONS = ["none", "bleps", "trouble"] as const;
 
 export type BleMode = (typeof BLE_OPTIONS)[number];
 
+export const DEBUG_BACKEND_OPTIONS = ["probe-rs", "openocd", "none"] as const;
+
+export type DebugBackend = (typeof DEBUG_BACKEND_OPTIONS)[number];
+
 export interface NewProjectFormState {
   name: string;
   outputPath: string;
   chip: EspChip;
   preset: ProjectPreset;
-  probeRs: boolean;
+  debugBackend: DebugBackend;
+  openocdConfigs: string;
   embassy: boolean;
   alloc: boolean;
   wifi: boolean;
@@ -53,7 +58,6 @@ export interface NewProjectFormState {
 
 export interface ToggleField {
   key:
-    | "probeRs"
     | "embassy"
     | "alloc"
     | "wifi"
@@ -91,6 +95,8 @@ export interface PatchCommandInput {
   projectPath: string;
   chip?: string;
   bin?: string;
+  debugBackend?: DebugBackend;
+  openocdConfigs?: string[];
   dryRun?: boolean;
   backup?: boolean;
 }
@@ -99,7 +105,7 @@ export const PRESET_DEFINITIONS: PresetDefinition[] = [
   {
     id: "recommended",
     label: "Recommended",
-    description: "Balanced defaults for VS Code, probe-rs, and day-to-day development.",
+    description: "Balanced defaults for VS Code, managed debug config, and day-to-day development.",
   },
   {
     id: "minimal",
@@ -129,11 +135,6 @@ export const PRESET_DEFINITIONS: PresetDefinition[] = [
 ];
 
 export const TOGGLE_FIELDS: ToggleField[] = [
-  {
-    key: "probeRs",
-    label: "probe-rs",
-    description: "Generate VS Code flash/debug integration for probe-rs.",
-  },
   {
     key: "embassy",
     label: "Embassy",
@@ -206,6 +207,8 @@ const RESERVED_ESPWRAP_ARGS: Record<string, string> = {
   "--name": "Project Name is already controlled by the form.",
   "--esp-generate-bin": "esp-generate Binary is already controlled by the form.",
   "--install-missing": "Install Missing Tools is already controlled by the checkbox.",
+  "--debug-backend": "Debug Backend is already controlled by the form.",
+  "--openocd-config": "OpenOCD Config Files are already controlled by the form.",
 };
 
 const RESERVED_GENERATE_ARGS: Record<string, string> = {
@@ -220,7 +223,8 @@ export function createDefaultState(defaultChip: EspChip, defaultInstallMissing: 
     outputPath,
     chip: defaultChip,
     preset: "recommended",
-    probeRs: true,
+    debugBackend: "probe-rs",
+    openocdConfigs: "",
     embassy: false,
     alloc: false,
     wifi: false,
@@ -249,27 +253,28 @@ export function applyPreset(state: NewProjectFormState, preset: ProjectPreset): 
 
   switch (preset) {
     case "recommended":
-      featureState.probeRs = true;
+      featureState.debugBackend = "probe-rs";
       featureState.log = true;
       featureState.espBacktrace = true;
       break;
     case "minimal":
+      featureState.debugBackend = "none";
       break;
     case "embassy":
-      featureState.probeRs = true;
+      featureState.debugBackend = "probe-rs";
       featureState.embassy = true;
       featureState.log = true;
       featureState.espBacktrace = true;
       break;
     case "connectivity":
-      featureState.probeRs = true;
+      featureState.debugBackend = "probe-rs";
       featureState.alloc = true;
       featureState.wifi = true;
       featureState.log = true;
       featureState.espBacktrace = true;
       break;
     case "debug":
-      featureState.probeRs = true;
+      featureState.debugBackend = "probe-rs";
       featureState.log = true;
       featureState.defmt = true;
       featureState.espBacktrace = true;
@@ -318,6 +323,12 @@ export function buildNewProjectCommand(
   }
 
   args.push("--name", state.name.trim());
+  args.push("--debug-backend", state.debugBackend);
+  if (state.debugBackend === "openocd") {
+    for (const config of parseOpenOcdConfigs(state.openocdConfigs)) {
+      args.push("--openocd-config", config);
+    }
+  }
 
   const extraEspwrapArgs = parseArgString(state.extraEspwrapArgs);
   args.push(...extraEspwrapArgs);
@@ -363,9 +374,6 @@ export function buildNewProjectCommand(
   if (state.ci) {
     args.push("-o", "ci");
   }
-  if (state.probeRs) {
-    args.push("-o", "probe-rs");
-  }
 
   args.push(...parseArgString(state.extraGenerateArgs));
 
@@ -384,6 +392,14 @@ export function buildPatchCommand(binaryPath: string, input: PatchCommandInput):
   }
   if (input.bin?.trim()) {
     args.push("--bin", input.bin.trim());
+  }
+  if (input.debugBackend?.trim()) {
+    args.push("--debug-backend", input.debugBackend.trim());
+  }
+  if (input.debugBackend === "openocd") {
+    for (const config of input.openocdConfigs ?? []) {
+      args.push("--openocd-config", config);
+    }
   }
   if (input.dryRun) {
     args.push("--dry-run");
@@ -448,6 +464,13 @@ export function parseArgString(input: string): string[] {
   return args;
 }
 
+export function parseOpenOcdConfigs(input: string): string[] {
+  return input
+    .split(/\r?\n/)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+}
+
 export function resolveOutputPath(outputPath: string, options: BuildCommandOptions = {}): string {
   const trimmed = outputPath.trim();
   if (!trimmed) {
@@ -498,7 +521,7 @@ function findReservedArgErrors(
 
 function createDefaultFeatureState() {
   return {
-    probeRs: false,
+    debugBackend: "none" as DebugBackend,
     embassy: false,
     alloc: false,
     wifi: false,

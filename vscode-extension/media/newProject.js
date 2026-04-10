@@ -4,7 +4,6 @@
   const presetLookup = Object.fromEntries(payload.metadata.presets.map((preset) => [preset.id, preset]));
   const presetStates = payload.metadata.presetStates || {};
   const featureKeys = [
-    "probeRs",
     "embassy",
     "alloc",
     "wifi",
@@ -24,9 +23,11 @@
     outputPath: document.getElementById("outputPath"),
     chip: document.getElementById("chip"),
     preset: document.getElementById("preset"),
+    debugBackend: document.getElementById("debugBackend"),
     bleMode: document.getElementById("bleMode"),
     espGenerateBin: document.getElementById("espGenerateBin"),
     extraEspwrapArgs: document.getElementById("extraEspwrapArgs"),
+    openocdConfigs: document.getElementById("openocdConfigs"),
     extraGenerateArgs: document.getElementById("extraGenerateArgs"),
     pickOutputPath: document.getElementById("pickOutputPath"),
     copyCommand: document.getElementById("copyCommand"),
@@ -47,9 +48,11 @@
       outputPath: controls.outputPath.value,
       chip: controls.chip.value,
       preset: controls.preset.value,
+      debugBackend: controls.debugBackend.value,
       bleMode: controls.bleMode.value,
       espGenerateBin: controls.espGenerateBin.value,
       extraEspwrapArgs: controls.extraEspwrapArgs.value,
+      openocdConfigs: controls.openocdConfigs.value,
       extraGenerateArgs: controls.extraGenerateArgs.value,
     };
 
@@ -80,10 +83,14 @@
         control.checked = Boolean(presetState[key]);
       }
     }
+    if ("debugBackend" in presetState && controls.debugBackend) {
+      controls.debugBackend.value = presetState.debugBackend;
+    }
     if ("bleMode" in presetState) {
       controls.bleMode.value = presetState.bleMode;
     }
 
+    syncBackendFields();
     updatePresetDescription(presetId);
     requestPreview();
   }
@@ -91,6 +98,14 @@
   function updatePresetDescription(presetId) {
     const preset = presetLookup[presetId];
     controls.presetDescription.textContent = preset ? preset.description : "";
+  }
+
+  function syncBackendFields() {
+    const isOpenOcd = controls.debugBackend.value === "openocd";
+    controls.openocdConfigs.disabled = !isOpenOcd;
+    controls.openocdConfigs.placeholder = isOpenOcd
+      ? "board/esp32c3-builtin.cfg\ninterface/ftdi/esp32_devkitj_v1.cfg"
+      : "Switch Debug Backend to OpenOCD + GDB to use custom config files.";
   }
 
   function requestPreview() {
@@ -115,6 +130,20 @@
 
     controls.errors.hidden = false;
     controls.errors.innerHTML = errors.map((error) => `<div>${escapeHtml(error)}</div>`).join("");
+  }
+
+  function setPreviewText(preview, errors) {
+    if (preview) {
+      controls.commandPreview.textContent = preview;
+      return;
+    }
+
+    if (errors && errors.length > 0) {
+      controls.commandPreview.textContent = "# Fix the validation errors above to render the full command preview.";
+      return;
+    }
+
+    controls.commandPreview.textContent = "# Preview will appear here.";
   }
 
   function escapeHtml(value) {
@@ -165,6 +194,9 @@
       if (element === controls.preset) {
         applyPreset(controls.preset.value);
       } else {
+        if (element === controls.debugBackend) {
+          syncBackendFields();
+        }
         requestPreview();
       }
     });
@@ -172,6 +204,9 @@
       if (element === controls.preset) {
         applyPreset(controls.preset.value);
       } else {
+        if (element === controls.debugBackend) {
+          syncBackendFields();
+        }
         requestPreview();
       }
     });
@@ -190,8 +225,9 @@
     }
 
     if (message.type === "preview") {
-      controls.commandPreview.textContent = message.preview || "";
-      setErrors(Array.isArray(message.errors) ? message.errors : []);
+      const errors = Array.isArray(message.errors) ? message.errors : [];
+      setPreviewText(message.preview || "", errors);
+      setErrors(errors);
       return;
     }
 
@@ -201,6 +237,7 @@
   });
 
   updatePresetDescription(controls.preset.value);
+  syncBackendFields();
   setSubmitting(false);
   requestPreview();
 })();
